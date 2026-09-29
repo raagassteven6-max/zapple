@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Code Checker · Phase 1</title>
+
+  <style>
+    :root {
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --text: #1c2128;
+      --muted: #5c6673;
+      --border: #cfd5dd;
+      --accent: #1f4fc4;
+      --ok: #11693f;
+      --ok-bg: #e2f4ea;
+      --error: #a8231b;
+      --error-bg: #fcebe9;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #14181d;
+        --panel: #1d232a;
+        --text: #e6eaef;
+        --muted: #97a1ad;
+        --border: #35404b;
+        --accent: #7ba3ff;
+        --ok: #6fd6a0;
+        --ok-bg: #163527;
+        --error: #ff9b93;
+        --error-bg: #3a1c1a;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 16px;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+
+    h1 { margin: 0 0 4px; font-size: 1.4rem; }
+    .subtitle { margin: 0 0 16px; color: var(--muted); }
+
+    label { display: block; margin-bottom: 6px; font-weight: 600; }
+
+    textarea {
+      width: 100%;
+      min-height: 260px;
+      padding: 12px;
+      resize: vertical;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font: 14px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      tab-size: 2;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin: 12px 0 16px;
+    }
+
+    select, button {
+      min-height: 44px;
+      padding: 0 16px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      font: inherit;
+    }
+
+    button { cursor: pointer; }
+
+    button.primary {
+      flex: 1;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+      font-weight: 600;
+    }
+
+    textarea:focus-visible,
+    select:focus-visible,
+    button:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .result {
+      padding: 14px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+    }
+
+    .result.ok    { background: var(--ok-bg);    color: var(--ok);    border-color: var(--ok); }
+    .result.error { background: var(--error-bg); color: var(--error); border-color: var(--error); }
+
+    .result-title { margin: 0 0 4px; font-weight: 700; }
+    .result-detail { margin: 0 0 8px; color: var(--text); }
+
+    .code-frame {
+      margin: 0 0 12px;
+      padding: 10px;
+      overflow-x: auto;
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 4px;
+      font: 13px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <h1>Code Checker</h1>
+    <p class="subtitle">Phase 1: is this valid JavaScript?</p>
+
+    <label for="code-input">Paste code</label>
+    <textarea id="code-input" spellcheck="false" autocapitalize="off" autocomplete="off"
+              placeholder="Paste JavaScript here"></textarea>
+
+    <div class="controls">
+      <select id="source-type" aria-label="Code type">
+        <option value="module">Module (import / export)</option>
+        <option value="script">Plain script</option>
+      </select>
+      <button id="clear-button" type="button">Clear</button>
+      <button id="check-button" type="button" class="primary">Check</button>
+    </div>
+
+    <div id="result" aria-live="polite"></div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/acorn@8.11.3/dist/acorn.js"></script>
+  <script>
+    "use strict";
+
+    // ---------- Checking (no DOM code here) ----------
+
+    /**
+     * Parses `code` and reports whether it is valid JavaScript syntax.
+     * Returns { ok: true } or { ok: false, problem: { message, line, column, sourceLine } }.
+     */
+    function checkSyntax(code, sourceType) {
+      try {
+        acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
+        return { ok: true };
+      } catch (error) {
+        if (!(error instanceof SyntaxError) || !error.loc) throw error;
+        return { ok: false, problem: describeProblem(error, code) };
+      }
+    }
+
+    function describeProblem(error, code) {
+      const { line, column } = error.loc;   // acorn: line starts at 1, column at 0
+      return {
+        // acorn appends " (line:column)" to its messages; we show the location separately
+        message: error.message.replace(/\s*\(\d+:\d+\)$/, ""),
+        line,
+        column: column + 1,
+        sourceLine: code.split("\n")[line - 1] ?? "",
+      };
+    }
+
+    // ---------- Display ----------
+
+    const codeInput   = document.getElementById("code-input");
+    const sourceType  = document.getElementById("source-type");
+    const resultPanel = document.getElementById("result");
+
+    /** Creates an element with optional class and text (textContent keeps pasted code inert). */
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function showResult(...nodes) {
+      resultPanel.replaceChildren(...nodes);
+    }
+
+    function showMessage(kind, title, detail) {
+      const box = el("div", `result ${kind}`);
+      box.append(el("p", "result-title", title));
+      if (detail) box.append(el("p", "result-detail", detail));
+      showResult(box);
+    }
+
+    /** Shows the bad line with a caret under the problem column. */
+    function buildCodeFrame({ line, column, sourceLine }) {
+      const gutter = `${line} | `;
+      // Keep tabs as tabs so the caret lines up with the code above it
+      const padding = sourceLine.slice(0, column - 1).replace(/[^\t]/g, " ");
+      const caretLine = " ".repeat(gutter.length) + padding + "^";
+      return el("pre", "code-frame", `${gutter}${sourceLine}\n${caretLine}`);
+    }
+
+    function showSyntaxError(problem) {
+      const box = el("div", "result error");
+      const jumpButton = el("button", "", `Go to line ${problem.line}`);
+      jumpButton.type = "button";
+      jumpButton.addEventListener("click", () => selectLine(problem.line));
+
+      box.append(
+        el("p", "result-title", "Syntax error"),
+        el("p", "result-detail", `${problem.message} (line ${problem.line}, column ${problem.column})`),
+        buildCodeFrame(problem),
+        jumpButton
+      );
+      showResult(box);
+    }
+
+    /** Highlights a line inside the textarea so it can be fixed right away. */
+    function selectLine(lineNumber) {
+      const lines = codeInput.value.split("\n");
+      const start = lines.slice(0, lineNumber - 1).reduce((sum, text) => sum + text.length + 1, 0);
+      codeInput.focus();
+      codeInput.setSelectionRange(start, start + lines[lineNumber - 1].length);
+    }
+
+    // ---------- Wiring ----------
+
+    function handleCheck() {
+      if (typeof acorn === "undefined") {
+        showMessage("error", "Parser not loaded", "Check your internet connection and reload the page.");
+        return;
+      }
+      if (codeInput.value.trim() === "") {
+        showMessage("error", "Nothing to check", "Paste some code first.");
+        return;
+      }
+
+      const outcome = checkSyntax(codeInput.value, sourceType.value);
+      if (outcome.ok) {
+        showMessage("ok", "OK", "The syntax is valid. Nothing has been run.");
+      } else {
+        showSyntaxError(outcome.problem);
+      }
+    }
+
+    function handleClear() {
+      codeInput.value = "";
+      showResult();
+      codeInput.focus();
+    }
+
+    document.getElementById("check-button").addEventListener("click", handleCheck);
+    document.getElementById("clear-button").addEventListener("click", handleClear);
+  </script>
+</body>
+</html>
