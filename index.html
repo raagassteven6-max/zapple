@@ -126,7 +126,7 @@
     .result.error { background: var(--error-bg); color: var(--error); border-color: var(--error); }
 
     .result-title { margin: 0 0 4px; font-weight: 700; }
-    .result-detail { margin: 0 0 8px; color: var(--text); }
+    .result-detail { margin: 0 0 8px; color: var(--text); white-space: pre-line; }
 
     .code-frame {
       margin: 0 0 12px;
@@ -221,15 +221,15 @@
     </div>
 
     <div class="field">
-      <label for="checks-input">Checks (optional): one JavaScript expression per line</label>
+      <label id="checks-label" for="checks-input">Checks (optional): one JavaScript expression per line</label>
       <textarea id="checks-input" class="checks-box" spellcheck="false" autocapitalize="off"
                 placeholder="add(2, 3) === 5"></textarea>
     </div>
 
     <div class="controls">
-      <select id="source-type" aria-label="Code type">
-        <option value="module">Module (import / export)</option>
-        <option value="script">Plain script</option>
+      <select id="language" aria-label="Language">
+        <option value="javascript">JavaScript</option>
+        <option value="python">Python</option>
       </select>
       <button id="clear-button" type="button">Clear</button>
       <button id="check-button" type="button" class="primary">Check</button>
@@ -274,6 +274,23 @@
         column: column + 1,
         sourceLine: code.split("\n")[line - 1] ?? "",
       };
+    }
+
+    /**
+     * Zapple does not ask whether JavaScript is a module or a plain script; it finds out.
+     * Module is tried first because it is stricter and catches more. If Module rejects the code,
+     * Plain script gets a turn. Returns { ok: true, sourceType } or { ok: false, problem }.
+     */
+    function checkSyntaxInBothModes(code, log) {
+      const asModule = checkSyntax(code, "module");
+      if (asModule.ok) return { ok: true, sourceType: "module" };
+
+      const asScript = checkSyntax(code, "script");
+      if (asScript.ok) {
+        log.add(`Module mode rejected the code (${asModule.problem.message}); plain script mode accepted it`);
+        return { ok: true, sourceType: "script" };
+      }
+      return { ok: false, problem: asModule.problem };   // both refused it: report the Module error
     }
 
     // ---------- Rule checks (no DOM code here) ----------
@@ -478,17 +495,28 @@
     function findSkipReason(code, sourceType) {
       for (const token of acorn.tokenizer(code, { ecmaVersion: "latest", sourceType })) {
         if (token.type === acorn.tokTypes._import) {
-          return "the code uses import, which the sandbox does not support yet.";
+          return {
+            reason: "it uses import, which loads other files or libraries. Zapple's test area cannot load them yet, so it cannot run this code.",
+            tip: "If the import is only for a helper you can copy, paste that helper into the box instead.",
+          };
         }
         if (token.type === acorn.tokTypes.name && PAGE_ONLY_NAMES.has(token.value)) {
-          return `the code uses "${token.value}", which only exists on a web page.`;
+          return {
+            reason: `it uses "${token.value}", which only exists inside a web page. Zapple tests code in a separate background area that has no web page, so this line would crash there even if it is correct on your site.`,
+            tip: "Test the logic separately: paste only the functions that calculate or handle data, and use Checks on them. The lines that touch the page are still covered by the syntax, rule and structure checks.",
+          };
         }
       }
       return null;
     }
 
-    function skippedRun(reason) {
-      return { status: "skipped", reason, errors: [], output: [], durationMs: 0, checkCount: 0 };
+    const FIX_FIRST = {
+      reason: "the checks above found errors, and running code that is already known to be broken would only repeat the same problem.",
+      tip: "Fix the errors (the repair prompt does this) and check again.",
+    };
+
+    function skippedRun(reason, tip) {
+      return { status: "skipped", reason, tip, errors: [], output: [], durationMs: 0, checkCount: 0 };
     }
 
     function runtimeFinding(message, line = null, column = null) {
@@ -515,8 +543,8 @@
      * status: "finished" | "crashed" | "timeout" | "skipped"
      */
     function runInSandbox({ code, sourceType, checksText, log }) {
-      const skipReason = findSkipReason(code, sourceType);
-      if (skipReason) return Promise.resolve(skippedRun(skipReason));
+      const skip = findSkipReason(code, sourceType);
+      if (skip) return Promise.resolve(skippedRun(skip.reason, skip.tip));
       const parsedChecks = parseChecks(checksText);
 
       return new Promise((resolve) => {
@@ -754,6 +782,221 @@
       return lines.join("\n");
     }
 
+    // ---------- Python engine (no DOM code here) ----------
+
+    // Python runs through Pyodide: Python compiled to work inside the browser.
+    // It loads only when Python is chosen (about 10 MB the first time, cached afterwards).
+    const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+    const PYTHON_LOAD_TIMEOUT_MS = 90000;
+
+    const PYTHON_SKIP_TIP = "The syntax and undefined-name checks above still apply to this code. Running it for real would need those packages installed, which is what the planned remote runner is for.";
+
+    // The Python that does the actual checking. It runs inside the worker and returns one result per check.
+    const PYTHON_SOURCE = String.raw`
+import ast, contextlib, io, json, re, sys, time, traceback
+from pyflakes.checker import Checker
+
+# pyflakes finding types that mean the code is wrong. Every other type is only a note.
+ERROR_KINDS = {"UndefinedName", "UndefinedLocal", "UndefinedExport", "DuplicateArgument",
+               "ReturnOutsideFunction", "YieldOutsideFunction"}
+MAX_OUTPUT_LINES = 200
+
+def finding(message, line=None, column=None, rule="", severity="error"):
+    return {"line": line, "column": column, "message": message, "ruleId": rule, "severity": severity}
+
+def blank_notebook_lines(code):
+    """Colab lines such as '!pip install x' or '%matplotlib inline' are not Python.
+    Swap them for 'pass' so line numbers stay the same. Returns (new code, lines swapped)."""
+    return re.subn(r"(?m)^([ \t]*)[!%].*$", r"\1pass", code)
+
+def outside_packages(tree):
+    """Imported packages that are not part of standard Python."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    return sorted(names - set(sys.stdlib_module_names))
+
+def rule_findings(tree, extra_names):
+    checker = Checker(tree, builtins=extra_names)
+    findings = []
+    for message in sorted(checker.messages, key=lambda m: m.lineno):
+        kind = type(message).__name__
+        severity = "error" if kind in ERROR_KINDS else "note"
+        text = message.message % message.message_args
+        findings.append(finding(text, message.lineno, message.col + 1, "pyflakes/" + kind, severity))
+    return findings
+
+def crash_finding(error):
+    line = None
+    for frame in traceback.extract_tb(error.__traceback__):
+        if frame.filename == "<user code>":
+            line = frame.lineno          # keeps the deepest line that belongs to the user's code
+    if line is None:
+        line = getattr(error, "lineno", None)
+    return finding(f"{type(error).__name__}: {error}", line, None, "runtime")
+
+def run_code(tree):
+    """Runs the code. Returns (variables it created, lines it printed, crash or None)."""
+    namespace = {"__name__": "__main__"}
+    printed = io.StringIO()
+    crash = None
+    try:
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
+            exec(compile(tree, "<user code>", "exec"), namespace)
+    except SystemExit:
+        pass
+    except BaseException as error:
+        crash = crash_finding(error)
+    return namespace, printed.getvalue().splitlines()[:MAX_OUTPUT_LINES], crash
+
+def run_checks(check_lines, namespace):
+    """Evaluates the user's checks, one expression per line. Returns (findings, number of valid checks)."""
+    findings, total = [], 0
+    for source in check_lines:
+        try:
+            node = ast.parse(source, mode="eval").body
+        except SyntaxError as error:
+            findings.append(finding(f"Check is not a valid expression ({error.msg}): {source}", rule="check"))
+            continue
+        total += 1
+        try:
+            if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
+                left = eval(ast.get_source_segment(source, node.left), namespace)
+                right = eval(ast.get_source_segment(source, node.comparators[0]), namespace)
+                passed, detail = left == right, f" (got {left!r})"
+            else:
+                passed, detail = bool(eval(source, namespace)), ""
+        except Exception as error:
+            findings.append(finding(f"Check crashed with {type(error).__name__}: {error}: {source}", rule="check"))
+            continue
+        if not passed:
+            findings.append(finding(f"Check failed{detail}: {source}", rule="check"))
+    return findings, total
+
+def analyze(request):
+    code, blanked = blank_notebook_lines(request["code"])
+    result = {"blanked": blanked, "syntax": None, "errors": [], "notes": [], "skipReason": None,
+              "output": [], "runErrors": [], "checkCount": 0}
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as error:
+        lines = code.split("\n")
+        line = error.lineno or 1
+        source_line = lines[line - 1] if line <= len(lines) else ""
+        result["syntax"] = {"message": error.msg, "line": line, "column": error.offset or 1, "sourceLine": source_line}
+        return result
+
+    findings = rule_findings(tree, request["extraNames"])
+    result["errors"] = [f for f in findings if f["severity"] == "error"]
+    result["notes"] = [f for f in findings if f["severity"] == "note"]
+    if result["errors"]:
+        return result                     # broken code is not run; the page explains why
+
+    outside = outside_packages(tree)
+    if outside:
+        result["skipReason"] = ("it imports " + ", ".join(outside) + ", which are not part of standard Python. "
+                                "Zapple's Python runs inside your browser and only has the standard library for now.")
+        return result
+
+    namespace, result["output"], crash = run_code(tree)
+    if crash:
+        result["runErrors"] = [crash]
+    else:
+        result["runErrors"], result["checkCount"] = run_checks(request["checks"], namespace)
+    return result
+
+def zapple_analyze(request_json):
+    started = time.perf_counter()
+    result = analyze(json.loads(request_json))
+    result["elapsedMs"] = round((time.perf_counter() - started) * 1000)
+    return json.dumps(result)
+`;
+
+    /** Runs inside the Python worker (copied in as text): loads Python, then answers "run" requests. */
+    function pythonWorkerMain() {
+      let pyodide = null;
+
+      self.onmessage = async ({ data }) => {
+        if (data.type === "init") {
+          try {
+            importScripts(`${data.pyodideUrl}pyodide.js`);
+            pyodide = await loadPyodide({ indexURL: data.pyodideUrl });
+            await pyodide.loadPackage("micropip");
+            await pyodide.pyimport("micropip").install("pyflakes");
+            pyodide.runPython(data.pythonSource);
+            self.postMessage({ type: "ready" });
+          } catch (error) {
+            self.postMessage({ type: "failed", message: String(error) });
+          }
+        } else if (data.type === "run") {
+          try {
+            const analyze = pyodide.globals.get("zapple_analyze");
+            self.postMessage({ type: "result", result: JSON.parse(analyze(JSON.stringify(data.request))) });
+          } catch (error) {
+            self.postMessage({ type: "result", result: { internalError: String(error) } });
+          }
+        }
+      };
+    }
+
+    let pythonWorker = null;   // a promise for the running Python worker; reused between checks
+
+    function startPythonWorker(log) {
+      log.add("Loading Python (about 10 MB the first time, then cached)...");
+      const url = URL.createObjectURL(new Blob([`(${pythonWorkerMain})();`], { type: "text/javascript" }));
+      const worker = new Worker(url);
+
+      const ready = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Python took too long to load. Check your internet connection and try again.")), PYTHON_LOAD_TIMEOUT_MS);
+        worker.onmessage = ({ data }) => {
+          if (data.type === "ready") { clearTimeout(timer); resolve(worker); }
+          if (data.type === "failed") { clearTimeout(timer); reject(new Error(`Python could not start: ${data.message}`)); }
+        };
+        worker.onerror = (event) => { clearTimeout(timer); reject(new Error(`Python could not start: ${event.message || "unknown error"}`)); };
+      });
+
+      worker.postMessage({ type: "init", pyodideUrl: PYODIDE_URL, pythonSource: PYTHON_SOURCE });
+      return ready.finally(() => URL.revokeObjectURL(url));
+    }
+
+    function getPythonWorker(log) {
+      if (!pythonWorker) {
+        pythonWorker = startPythonWorker(log).catch((error) => {
+          pythonWorker = null;   // let the next check try again from scratch
+          throw error;
+        });
+      }
+      return pythonWorker;
+    }
+
+    /**
+     * Sends code to the Python worker and waits for its answer.
+     * If the code has not finished in time, the worker is stopped (a fresh one starts next time)
+     * and { timedOut: true } is returned.
+     */
+    async function runPythonAnalysis(request, log) {
+      const worker = await getPythonWorker(log);
+
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          worker.terminate();
+          pythonWorker = null;
+          resolve({ timedOut: true });
+        }, RUN_TIMEOUT_MS);
+
+        worker.onmessage = ({ data }) => {
+          if (data.type !== "result") return;
+          clearTimeout(timer);
+          resolve(data.result);
+        };
+        worker.postMessage({ type: "run", request });
+      });
+    }
+
     // ---------- Repair prompt (no DOM code here) ----------
 
     const CONTEXT_LINES = 3;   // lines shown above and below the error
@@ -797,34 +1040,43 @@
       return "`".repeat(Math.max(3, longestRun + 1));
     }
 
+    /** What kind of code this is, in words the AI understands. */
+    function describeCodeType({ language, sourceType }) {
+      if (language === "python") return "Python 3";
+      if (sourceType === "module") return "JavaScript ES module";
+      if (sourceType === "script") return "JavaScript plain script";
+      return "JavaScript";
+    }
+
     /** The parts every repair prompt shares; each check supplies its own intro, details and rules. */
-    function assemblePrompt({ intro, task, sourceType, details, rules, code }) {
+    function assemblePrompt({ intro, task, language, sourceType, details, rules, code }) {
       const fence = fenceFor(code);
+      const fenceLanguage = language === "python" ? "python" : "js";
       const sections = [
         intro,
         task ? `What the code should do: ${task}` : null,
-        `Code type: ${sourceType === "module" ? "ES module" : "plain script"}`,
+        `Code type: ${describeCodeType({ language, sourceType })}`,
         details,
         rules.join("\n"),
-        `Full code:\n${fence}js\n${code}\n${fence}`,
+        `Full code:\n${fence}${fenceLanguage}\n${code}\n${fence}`,
       ];
       return sections.filter(Boolean).join("\n\n");
     }
 
-    function buildSyntaxPrompt({ code, problem, sourceType, task }) {
+    function buildSyntaxPrompt({ code, problem, language, sourceType, task }) {
       const details = [
         `Error: ${problem.message} (line ${problem.line}, column ${problem.column})`,
         `Code around the error (">" marks the line):\n${buildContext(code, problem.line)}`,
       ].join("\n\n");
 
       return assemblePrompt({
-        intro: "Fix the syntax error in the JavaScript below.",
-        task, sourceType, details, code,
+        intro: "Fix the syntax error in the code below.",
+        task, language, sourceType, details, code,
         rules: SYNTAX_FIX_RULES,
       });
     }
 
-    function buildLintPrompt({ code, errors, sourceType, task }) {
+    function buildLintPrompt({ code, errors, language, sourceType, task }) {
       const lines = code.split("\n");
       const problems = errors.map((finding, index) => {
         const rule = finding.ruleId ? ` [${finding.ruleId}]` : "";
@@ -835,8 +1087,8 @@
       });
 
       return assemblePrompt({
-        intro: "Fix the problems found in the JavaScript below.",
-        task, sourceType, code,
+        intro: "Fix the problems found in the code below.",
+        task, language, sourceType, code,
         details: `Problems found:\n${problems.join("\n")}`,
         rules: LINT_FIX_RULES,
       });
@@ -845,7 +1097,7 @@
     // ---------- Display ----------
 
     const codeInput   = document.getElementById("code-input");
-    const sourceType  = document.getElementById("source-type");
+    const languageSelect = document.getElementById("language");
     const taskInput   = document.getElementById("task-input");
     const globalsInput = document.getElementById("globals-input");
     const checksInput = document.getElementById("checks-input");
@@ -963,8 +1215,19 @@
       return box;
     }
 
+    /** Why the test run was skipped, in plain words: the cause, what still ran, what did not, and what to do. */
+    function describeSkippedRun(run) {
+      return [
+        "No errors found by the checks that ran, but the code itself was not test-run.",
+        `Why: ${run.reason}`,
+        "Still checked: everything except the test run.",
+        "Not checked: the test run itself, and your Checks (they run as part of the test run).",
+        run.tip ? `Tip: ${run.tip}` : null,
+      ].filter(Boolean).join("\n\n");
+    }
+
     function describeRunOutcome(run) {
-      if (run.status === "skipped") return `No errors found. Not run: ${run.reason}`;
+      if (run.status === "skipped") return describeSkippedRun(run);
       const checks = run.checkCount > 0 ? ` All ${countLabel(run.checkCount, "check")} passed.` : "";
       return `No errors found. The code ran without crashing (${run.durationMs} ms).${checks}`;
     }
@@ -1010,6 +1273,57 @@
 
     // ---------- Wiring ----------
 
+    /** The Python version of the Check button: syntax, then pyflakes rules, then a test run of standard-library code. */
+    async function checkPython(request) {
+      const analysis = await runPythonAnalysis({
+        code: request.code,
+        extraNames: request.extraGlobals,
+        checks: request.checksText.split("\n").map((line) => line.trim()).filter(Boolean),
+      }, log);
+
+      if (analysis.internalError) throw new Error(analysis.internalError);
+
+      if (analysis.timedOut) {
+        const seconds = RUN_TIMEOUT_MS / 1000;
+        log.add(`Timeout: the code did not finish within ${seconds} s. Python was stopped and restarts on the next check`);
+        const errors = [runtimeFinding(`The code did not finish within ${seconds} seconds (possible infinite loop or endless wait)`)];
+        showReport({ errors, notes: [], callMap: "", run: skippedRun(), promptText: buildLintPrompt({ ...request, errors }) });
+        return;
+      }
+
+      if (analysis.blanked > 0) {
+        log.add(`Replaced ${countLabel(analysis.blanked, "notebook command line")} (like !pip or %magic) with "pass", keeping line numbers`);
+      }
+      if (analysis.syntax) {
+        log.add(`Syntax check: error at line ${analysis.syntax.line}`);
+        showSyntaxError(analysis.syntax, buildSyntaxPrompt({ ...request, problem: analysis.syntax }));
+        return;
+      }
+      log.add("Syntax check: passed");
+      log.add(`Rule check (pyflakes): ${countLabel(analysis.errors.length, "error")}, ${countLabel(analysis.notes.length, "note")}`);
+
+      let run;
+      if (analysis.errors.length > 0) {
+        run = skippedRun(FIX_FIRST.reason, FIX_FIRST.tip);
+      } else if (analysis.skipReason) {
+        run = skippedRun(analysis.skipReason, PYTHON_SKIP_TIP);
+      } else {
+        run = { status: "finished", errors: analysis.runErrors, output: analysis.output, durationMs: analysis.elapsedMs, checkCount: analysis.checkCount };
+      }
+
+      if (run.status === "skipped") {
+        log.add(`Test run skipped: ${run.reason}`);
+      } else {
+        run.output.forEach((line) => log.add(`print: ${line}`));
+        run.errors.forEach((problem) => log.add(`Problem: ${problem.message}${problem.line ? ` (line ${problem.line})` : ""}`));
+        log.add(`Test run complete (${run.durationMs} ms, including your checks)`);
+      }
+
+      const errors = [...analysis.errors, ...run.errors];
+      const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
+      showReport({ errors, notes: analysis.notes, callMap: "", run, promptText });
+    }
+
     async function handleCheck() {
       if (typeof acorn === "undefined") {
         showMessage("error", "Parser not loaded", "Check your internet connection and reload the page.");
@@ -1023,20 +1337,26 @@
       log.reset();
       const request = {
         code: codeInput.value,
-        sourceType: sourceType.value,
+        language: languageSelect.value,
         task: taskInput.value.trim(),
         extraGlobals: parseNameList(globalsInput.value),
         checksText: checksInput.value,
       };
-      log.add(`Check started: ${request.sourceType}, ${countLabel(request.code.split("\n").length, "line")}`);
+      log.add(`Check started: ${request.language}, ${countLabel(request.code.split("\n").length, "line")}`);
 
-      const syntax = checkSyntax(request.code, request.sourceType);
+      if (request.language === "python") {
+        await checkPython(request);
+        return;
+      }
+
+      const syntax = checkSyntaxInBothModes(request.code, log);
       if (!syntax.ok) {
         log.add(`Syntax check: error at line ${syntax.problem.line}`);
         showSyntaxError(syntax.problem, buildSyntaxPrompt({ ...request, problem: syntax.problem }));
         return;
       }
-      log.add("Syntax check: passed");
+      request.sourceType = syntax.sourceType;
+      log.add(`Syntax check: passed (detected ${syntax.sourceType === "module" ? "module" : "plain script"})`);
 
       if (typeof eslint === "undefined") {
         log.add("Rule check: could not load ESLint");
@@ -1059,7 +1379,7 @@
       // Only test-run code that passed the static checks, so the same problem is not reported twice
       const run = staticErrors.length === 0
         ? await runInSandbox({ ...request, log })
-        : skippedRun("fix the errors above first.");
+        : skippedRun(FIX_FIRST.reason, FIX_FIRST.tip);
       if (run.status === "skipped") log.add(`Sandbox skipped: ${run.reason}`);
 
       const errors = [...staticErrors, ...run.errors];
@@ -1085,6 +1405,31 @@
         checkButton.disabled = false;
       }
     });
+    // The hint texts follow the chosen language, so the boxes always describe what to type there
+    const LANGUAGE_HINTS = {
+      javascript: {
+        code: "Paste JavaScript here",
+        names: "Names from libraries you load, like THREE, Chart",
+        checksLabel: "Checks (optional): one JavaScript expression per line",
+        checks: "add(2, 3) === 5",
+      },
+      python: {
+        code: "Paste Python here",
+        names: "Names defined in earlier notebook cells, like df, model",
+        checksLabel: "Checks (optional): one Python expression per line",
+        checks: "add(2, 3) == 5",
+      },
+    };
+
+    function applyLanguage() {
+      const hints = LANGUAGE_HINTS[languageSelect.value];
+      codeInput.placeholder = hints.code;
+      globalsInput.placeholder = hints.names;
+      checksInput.placeholder = hints.checks;
+      document.getElementById("checks-label").textContent = hints.checksLabel;
+    }
+
+    languageSelect.addEventListener("change", applyLanguage);
     document.getElementById("clear-button").addEventListener("click", handleClear);
   </script>
 </body>
