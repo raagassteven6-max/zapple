@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Code Checker · Phase 3</title>
+
+  <script>
+    // Snapshot of every name this browser provides (window, document, fetch, ...).
+    // It runs before any library loads, so libraries and this page's own functions
+    // are not mistaken for browser built-ins.
+    const BROWSER_GLOBALS = (() => {
+      const names = new Set();
+      for (let holder = window; holder && holder !== Object.prototype; holder = Object.getPrototypeOf(holder)) {
+        Object.getOwnPropertyNames(holder).forEach((name) => names.add(name));
+      }
+      names.delete("constructor");
+      return [...names];
+    })();
+  </script>
+
+  <style>
+    :root {
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --text: #1c2128;
+      --muted: #5c6673;
+      --border: #cfd5dd;
+      --accent: #1f4fc4;
+      --ok: #11693f;
+      --ok-bg: #e2f4ea;
+      --error: #a8231b;
+      --error-bg: #fcebe9;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #14181d;
+        --panel: #1d232a;
+        --text: #e6eaef;
+        --muted: #97a1ad;
+        --border: #35404b;
+        --accent: #7ba3ff;
+        --ok: #6fd6a0;
+        --ok-bg: #163527;
+        --error: #ff9b93;
+        --error-bg: #3a1c1a;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 16px;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+
+    h1 { margin: 0 0 4px; font-size: 1.4rem; }
+    .subtitle { margin: 0 0 16px; color: var(--muted); }
+
+    label { display: block; margin-bottom: 6px; font-weight: 600; }
+
+    textarea {
+      width: 100%;
+      min-height: 260px;
+      padding: 12px;
+      resize: vertical;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font: 14px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      tab-size: 2;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin: 12px 0 16px;
+    }
+
+    select, button {
+      min-height: 44px;
+      padding: 0 16px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      font: inherit;
+    }
+
+    button { cursor: pointer; }
+
+    button.primary {
+      flex: 1;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+      font-weight: 600;
+    }
+
+    textarea:focus-visible,
+    select:focus-visible,
+    button:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .result {
+      padding: 14px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+    }
+
+    .result.ok    { background: var(--ok-bg);    color: var(--ok);    border-color: var(--ok); }
+    .result.error { background: var(--error-bg); color: var(--error); border-color: var(--error); }
+
+    .result-title { margin: 0 0 4px; font-weight: 700; }
+    .result-detail { margin: 0 0 8px; color: var(--text); }
+
+    .code-frame {
+      margin: 0 0 12px;
+      padding: 10px;
+      overflow-x: auto;
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 4px;
+      font: 13px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+
+    .field { margin-top: 12px; }
+
+    input[type="text"] {
+      width: 100%;
+      min-height: 44px;
+      padding: 0 12px;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font: inherit;
+    }
+
+    input[type="text"]:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .prompt-section { margin-top: 16px; }
+    .prompt-box { min-height: 180px; font-size: 13px; }
+    .prompt-section button.primary { width: 100%; margin-top: 8px; }
+
+    .result + .result { margin-top: 12px; }
+    .result.note { background: var(--panel); color: var(--text); border-color: var(--border); }
+
+    .finding-list {
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .finding {
+      width: 100%;
+      min-height: 44px;
+      padding: 8px 12px;
+      text-align: left;
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <h1>Code Checker</h1>
+    <p class="subtitle">Phase 3: syntax, then rule checks, then a repair prompt</p>
+
+    <label for="code-input">Paste code</label>
+    <textarea id="code-input" spellcheck="false" autocapitalize="off" autocomplete="off"
+              placeholder="Paste JavaScript here"></textarea>
+
+    <div class="field">
+      <label for="task-input">What should this code do? (optional)</label>
+      <input id="task-input" type="text" autocomplete="off"
+             placeholder="One sentence, included in the repair prompt">
+    </div>
+
+    <div class="field">
+      <label for="globals-input">Extra names the code may use (optional)</label>
+      <input id="globals-input" type="text" autocomplete="off" autocapitalize="off"
+             placeholder="Names from libraries you load, like THREE, Chart">
+    </div>
+
+    <div class="controls">
+      <select id="source-type" aria-label="Code type">
+        <option value="module">Module (import / export)</option>
+        <option value="script">Plain script</option>
+      </select>
+      <button id="clear-button" type="button">Clear</button>
+      <button id="check-button" type="button" class="primary">Check</button>
+    </div>
+
+    <div id="result" aria-live="polite"></div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/acorn@8.11.3/dist/acorn.js"></script>
+  <!-- ESLint's rule engine, bundled for browsers. Exposes the global `eslint`. -->
+  <script src="https://cdn.jsdelivr.net/npm/eslint-linter-browserify@9/linter.js"></script>
+  <script>
+    "use strict";
+
+    // ---------- Checking (no DOM code here) ----------
+
+    /**
+     * Parses `code` and reports whether it is valid JavaScript syntax.
+     * Returns { ok: true } or { ok: false, problem: { message, line, column, sourceLine } }.
+     */
+    function checkSyntax(code, sourceType) {
+      try {
+        acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
+        return { ok: true };
+      } catch (error) {
+        if (!(error instanceof SyntaxError) || !error.loc) throw error;
+        return { ok: false, problem: describeProblem(error, code) };
+      }
+    }
+
+    function describeProblem(error, code) {
+      const { line, column } = error.loc;   // acorn: line starts at 1, column at 0
+      return {
+        // acorn appends " (line:column)" to its messages; we show the location separately
+        message: error.message.replace(/\s*\(\d+:\d+\)$/, ""),
+        line,
+        column: column + 1,
+        sourceLine: code.split("\n")[line - 1] ?? "",
+      };
+    }
+
+    // ---------- Rule checks (no DOM code here) ----------
+
+    // "error" problems are sent to the AI in the repair prompt.
+    // "warn" notes are shown on screen only, so the AI is not asked to tidy code you didn't ask about.
+    const ESLINT_RULES = {
+      // Code that fails or behaves wrongly
+      "no-undef": "error",
+      "no-const-assign": "error",
+      "no-redeclare": ["error", { builtinGlobals: false }],
+      "no-dupe-keys": "error",
+      "no-dupe-args": "error",
+      "no-dupe-class-members": "error",
+      "no-dupe-else-if": "error",
+      "no-import-assign": "error",
+      "no-unreachable": "error",
+      "no-unsafe-negation": "error",
+      "valid-typeof": "error",
+      "use-isnan": "error",
+      "getter-return": "error",
+      "constructor-super": "error",
+      "no-this-before-super": "error",
+      // Banned patterns
+      "no-eval": "error",
+      // Housekeeping
+      "no-unused-vars": ["warn", { vars: "local", args: "none" }],
+    };
+
+    const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+
+    /** "THREE, Chart  d3" -> ["THREE", "Chart", "d3"] (anything that isn't a valid name is dropped) */
+    function parseNameList(text) {
+      return text.split(/[\s,]+/).filter((name) => IDENTIFIER.test(name));
+    }
+
+    function buildLintConfig(sourceType, extraGlobals) {
+      const names = [...BROWSER_GLOBALS, ...extraGlobals].filter((name) => IDENTIFIER.test(name));
+      return {
+        languageOptions: {
+          ecmaVersion: "latest",
+          sourceType,
+          globals: Object.fromEntries(names.map((name) => [name, "readonly"])),
+        },
+        rules: ESLINT_RULES,
+      };
+    }
+
+    function toFinding(message) {
+      return {
+        line: message.line,
+        column: message.column,
+        message: message.message,
+        ruleId: message.ruleId,
+        severity: message.severity === 2 ? "error" : "note",
+      };
+    }
+
+    /**
+     * Runs the ESLint rules on code that already passed the syntax check.
+     * Returns { errors, notes }, each a list of { line, column, message, ruleId, severity }.
+     */
+    function lintCode({ code, sourceType, extraGlobals }) {
+      const linter = new eslint.Linter({ configType: "flat" });
+      const config = buildLintConfig(sourceType, extraGlobals);
+      const findings = linter.verify(code, config, { filename: "input.js" }).map(toFinding);
+
+      return {
+        errors: findings.filter((finding) => finding.severity === "error"),
+        notes: findings.filter((finding) => finding.severity === "note"),
+      };
+    }
+
+    // ---------- Repair prompt (no DOM code here) ----------
+
+    const CONTEXT_LINES = 3;   // lines shown above and below the error
+
+    const REPLY_RULE = "- Reply with only the complete corrected code in one code block. No explanation.";
+
+    const SYNTAX_FIX_RULES = [
+      "Rules:",
+      "- Fix only this error. Do not rewrite, rename, reformat, or add features.",
+      "- If you spot other syntax errors, fix those too, and change nothing else.",
+      REPLY_RULE,
+    ];
+
+    const LINT_FIX_RULES = [
+      "Rules:",
+      "- Fix every problem listed and change nothing else. Do not rewrite, rename, reformat, or add features.",
+      "- For a name that is not defined, either define it or use the correct name that already exists in the code. Do not delete the code that uses it.",
+      REPLY_RULE,
+    ];
+
+    /** Numbered lines around the error, with ">" marking the bad one. */
+    function buildContext(code, errorLine) {
+      const lines = code.split("\n");
+      const first = Math.max(1, errorLine - CONTEXT_LINES);
+      const last = Math.min(lines.length, errorLine + CONTEXT_LINES);
+      const width = String(last).length;
+
+      const rows = [];
+      for (let number = first; number <= last; number++) {
+        const marker = number === errorLine ? ">" : " ";
+        rows.push(`${marker} ${String(number).padStart(width)} | ${lines[number - 1]}`);
+      }
+      return rows.join("\n");
+    }
+
+    /** A code fence longer than any backtick run inside the code, so the code can't break out of it. */
+    function fenceFor(code) {
+      const longestRun = (code.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+      return "`".repeat(Math.max(3, longestRun + 1));
+    }
+
+    /** The parts every repair prompt shares; each check supplies its own intro, details and rules. */
+    function assemblePrompt({ intro, task, sourceType, details, rules, code }) {
+      const fence = fenceFor(code);
+      const sections = [
+        intro,
+        task ? `What the code should do: ${task}` : null,
+        `Code type: ${sourceType === "module" ? "ES module" : "plain script"}`,
+        details,
+        rules.join("\n"),
+        `Full code:\n${fence}js\n${code}\n${fence}`,
+      ];
+      return sections.filter(Boolean).join("\n\n");
+    }
+
+    function buildSyntaxPrompt({ code, problem, sourceType, task }) {
+      const details = [
+        `Error: ${problem.message} (line ${problem.line}, column ${problem.column})`,
+        `Code around the error (">" marks the line):\n${buildContext(code, problem.line)}`,
+      ].join("\n\n");
+
+      return assemblePrompt({
+        intro: "Fix the syntax error in the JavaScript below.",
+        task, sourceType, details, code,
+        rules: SYNTAX_FIX_RULES,
+      });
+    }
+
+    function buildLintPrompt({ code, errors, sourceType, task }) {
+      const lines = code.split("\n");
+      const problems = errors.map((finding, index) => {
+        const rule = finding.ruleId ? ` [${finding.ruleId}]` : "";
+        const heading = `${index + 1}. Line ${finding.line}, column ${finding.column}: ${finding.message}${rule}`;
+        return `${heading}\n   > ${(lines[finding.line - 1] ?? "").trim()}`;
+      });
+
+      return assemblePrompt({
+        intro: "Fix the problems found in the JavaScript below.",
+        task, sourceType, code,
+        details: `Problems found:\n${problems.join("\n")}`,
+        rules: LINT_FIX_RULES,
+      });
+    }
+
+    // ---------- Display ----------
+
+    const codeInput   = document.getElementById("code-input");
+    const sourceType  = document.getElementById("source-type");
+    const taskInput   = document.getElementById("task-input");
+    const globalsInput = document.getElementById("globals-input");
+    const resultPanel = document.getElementById("result");
+
+    /** Creates an element with optional class and text (textContent keeps pasted code inert). */
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function showResult(...nodes) {
+      resultPanel.replaceChildren(...nodes);
+    }
+
+    function buildMessageBox(kind, title, detail) {
+      const box = el("div", `result ${kind}`);
+      box.append(el("p", "result-title", title));
+      if (detail) box.append(el("p", "result-detail", detail));
+      return box;
+    }
+
+    function showMessage(kind, title, detail) {
+      showResult(buildMessageBox(kind, title, detail));
+    }
+
+    /** Shows the bad line with a caret under the problem column. */
+    function buildCodeFrame({ line, column, sourceLine }) {
+      const gutter = `${line} | `;
+      // Keep tabs as tabs so the caret lines up with the code above it
+      const padding = sourceLine.slice(0, column - 1).replace(/[^\t]/g, " ");
+      const caretLine = " ".repeat(gutter.length) + padding + "^";
+      return el("pre", "code-frame", `${gutter}${sourceLine}\n${caretLine}`);
+    }
+
+    function showSyntaxError(problem, promptText) {
+      const box = el("div", "result error");
+      const jumpButton = el("button", "", `Go to line ${problem.line}`);
+      jumpButton.type = "button";
+      jumpButton.addEventListener("click", () => selectLine(problem.line));
+
+      box.append(
+        el("p", "result-title", "Syntax error"),
+        el("p", "result-detail", `${problem.message} (line ${problem.line}, column ${problem.column})`),
+        buildCodeFrame(problem),
+        jumpButton
+      );
+      showResult(box, buildPromptSection(promptText));
+    }
+
+    /** The repair prompt in a read-only box, with a button that copies it. */
+    function buildPromptSection(promptText) {
+      const label = el("label", "", "Repair prompt");
+      label.htmlFor = "prompt-output";
+
+      const promptBox = el("textarea", "prompt-box");
+      promptBox.id = "prompt-output";
+      promptBox.readOnly = true;
+      promptBox.value = promptText;
+
+      const copyButton = el("button", "primary", "Copy repair prompt");
+      copyButton.type = "button";
+      copyButton.addEventListener("click", () => copyPrompt(promptBox, copyButton));
+
+      const section = el("div", "prompt-section");
+      section.append(label, promptBox, copyButton);
+      return section;
+    }
+
+    async function copyPrompt(promptBox, button) {
+      try {
+        await navigator.clipboard.writeText(promptBox.value);
+        flashLabel(button, "Copied");
+      } catch {
+        // Clipboard blocked: select the text so it can be copied by hand
+        promptBox.focus();
+        promptBox.select();
+        flashLabel(button, "Selected. Copy it manually");
+      }
+    }
+
+    /** Shows a message on a button for two seconds, then restores its label. */
+    function flashLabel(button, message) {
+      const original = button.textContent;
+      button.textContent = message;
+      setTimeout(() => { button.textContent = original; }, 2000);
+    }
+
+    function countLabel(count, noun) {
+      return `${count} ${noun}${count === 1 ? "" : "s"}`;
+    }
+
+    /** One tappable row per finding; tapping jumps to that line in the code box. */
+    function buildFindingList(findings) {
+      const list = el("ul", "finding-list");
+      for (const finding of findings) {
+        const row = el("button", "finding", `Line ${finding.line}: ${finding.message}`);
+        row.type = "button";
+        row.addEventListener("click", () => selectLine(finding.line));
+        const item = el("li");
+        item.append(row);
+        list.append(item);
+      }
+      return list;
+    }
+
+    function buildFindingsBox(kind, title, findings) {
+      const box = el("div", `result ${kind}`);
+      box.append(el("p", "result-title", title), buildFindingList(findings));
+      return box;
+    }
+
+    /** Shows errors (with the repair prompt) and notes. With no errors, shows OK. */
+    function showLintReport({ errors, notes, promptText }) {
+      const blocks = [];
+
+      if (errors.length === 0) {
+        blocks.push(buildMessageBox("ok", "OK", "No errors found. Nothing has been run."));
+      } else {
+        blocks.push(buildFindingsBox("error", countLabel(errors.length, "problem"), errors));
+      }
+      if (notes.length > 0) {
+        blocks.push(buildFindingsBox("note", countLabel(notes.length, "note"), notes));
+      }
+      if (promptText) {
+        blocks.push(buildPromptSection(promptText));
+      }
+      showResult(...blocks);
+    }
+
+    /** Highlights a line inside the textarea so it can be fixed right away. */
+    function selectLine(lineNumber) {
+      const lines = codeInput.value.split("\n");
+      const start = lines.slice(0, lineNumber - 1).reduce((sum, text) => sum + text.length + 1, 0);
+      codeInput.focus();
+      codeInput.setSelectionRange(start, start + lines[lineNumber - 1].length);
+    }
+
+    // ---------- Wiring ----------
+
+    function handleCheck() {
+      if (typeof acorn === "undefined") {
+        showMessage("error", "Parser not loaded", "Check your internet connection and reload the page.");
+        return;
+      }
+      if (codeInput.value.trim() === "") {
+        showMessage("error", "Nothing to check", "Paste some code first.");
+        return;
+      }
+
+      const request = {
+        code: codeInput.value,
+        sourceType: sourceType.value,
+        task: taskInput.value.trim(),
+        extraGlobals: parseNameList(globalsInput.value),
+      };
+
+      const syntax = checkSyntax(request.code, request.sourceType);
+      if (!syntax.ok) {
+        showSyntaxError(syntax.problem, buildSyntaxPrompt({ ...request, problem: syntax.problem }));
+        return;
+      }
+
+      if (typeof eslint === "undefined") {
+        showMessage("error", "Rule checker not loaded",
+          "The syntax is valid, but the rule checker could not load. Check your internet connection and reload the page.");
+        return;
+      }
+
+      const { errors, notes } = lintCode(request);
+      const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
+      showLintReport({ errors, notes, promptText });
+    }
+
+    function handleClear() {
+      codeInput.value = "";
+      showResult();
+      codeInput.focus();
+    }
+
+    document.getElementById("check-button").addEventListener("click", handleCheck);
+    document.getElementById("clear-button").addEventListener("click", handleClear);
+  </script>
+</body>
+</html>
