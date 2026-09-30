@@ -178,6 +178,8 @@
       text-align: left;
     }
 
+    .checks-box { min-height: 88px; }
+
     .log { margin-top: 16px; }
 
     .log summary {
@@ -216,6 +218,12 @@
       <label for="globals-input">Extra names the code may use (optional)</label>
       <input id="globals-input" type="text" autocomplete="off" autocapitalize="off"
              placeholder="Names from libraries you load, like THREE, Chart">
+    </div>
+
+    <div class="field">
+      <label for="checks-input">Checks (optional): one JavaScript expression per line</label>
+      <textarea id="checks-input" class="checks-box" spellcheck="false" autocapitalize="off"
+                placeholder="add(2, 3) === 5"></textarea>
     </div>
 
     <div class="controls">
@@ -378,6 +386,7 @@
         if (value instanceof Error) return `${value.name}: ${value.message}`;
         try { return JSON.stringify(value) ?? String(value); } catch { return String(value); }
       };
+      self.zappleDescribe = describe;   // used by the generated check code
 
       for (const level of ["log", "info", "warn", "error", "debug"]) {
         console[level] = (...args) => send({ type: "console", level, text: args.map(describe).join(" ") });
@@ -411,8 +420,58 @@
     const WORKER_PREAMBLE = `(${workerSetup.toString()})();`;
     const PREAMBLE_LINES = WORKER_PREAMBLE.split("\n").length;   // user code starts on the next line
 
-    function buildWorkerSource(code) {
-      return `${WORKER_PREAMBLE}\n${code}\nself.postMessage({ type: "finished" });`;
+    function buildWorkerSource(code, checks) {
+      const checkSources = checks.map(buildCheckSource).join("\n");
+      return `${WORKER_PREAMBLE}\n${code}\n${checkSources}\nself.postMessage({ type: "finished" });`;
+    }
+
+    function checkFinding(message) {
+      return { line: null, column: null, message, ruleId: "check", severity: "error" };
+    }
+
+    /**
+     * Reads the Checks box (one JavaScript expression per line).
+     * Returns { checks, problems }: runnable checks, and findings for lines that are not valid expressions.
+     * A check written as `a === b` keeps both sides, so a failure can report what `a` actually was.
+     */
+    function parseChecks(text) {
+      const checks = [];
+      const problems = [];
+      const lines = text.split("\n").map((line) => line.trim().replace(/;+$/, "")).filter(Boolean);
+
+      for (const source of lines) {
+        try {
+          const node = acorn.parseExpressionAt(source, 0, { ecmaVersion: "latest" });
+          if (source.slice(node.end).trim() !== "") throw new SyntaxError("only one expression per line");
+          const isEquality = node.type === "BinaryExpression" && node.operator === "===";
+          checks.push({
+            source,
+            left: isEquality ? source.slice(node.left.start, node.left.end) : null,
+            right: isEquality ? source.slice(node.right.start, node.right.end) : null,
+          });
+        } catch (error) {
+          problems.push(checkFinding(`Check is not a valid expression (${error.message.replace(/\s*\(\d+:\d+\)$/, "")}): ${source}`));
+        }
+      }
+      return { checks, problems };
+    }
+
+    /** Code appended to the user's code: evaluates one check and reports the result. */
+    function buildCheckSource({ source, left, right }, index) {
+      const report = left !== null
+        ? `const left = (${left}); const right = (${right}); self.postMessage({ type: "check", index: ${index}, passed: left === right, actual: self.zappleDescribe(left) });`
+        : `self.postMessage({ type: "check", index: ${index}, passed: Boolean((${source})) });`;
+      return `try { ${report} } catch (error) { self.postMessage({ type: "check", index: ${index}, passed: false, error: error.name + ": " + error.message }); }`;
+    }
+
+    /** Findings for the checks that failed or crashed. */
+    function failedCheckFindings(results, checks) {
+      return results.filter((result) => !result.passed).map((result) => {
+        const outcome = result.error
+          ? `crashed with ${result.error}`
+          : result.actual !== undefined ? `failed (got ${result.actual})` : "failed";
+        return checkFinding(`Check ${outcome}: ${checks[result.index].source}`);
+      });
     }
 
     /** The reason this code cannot be test-run yet, or null if it can. */
@@ -429,7 +488,7 @@
     }
 
     function skippedRun(reason) {
-      return { status: "skipped", reason, errors: [], output: [], durationMs: 0 };
+      return { status: "skipped", reason, errors: [], output: [], durationMs: 0, checkCount: 0 };
     }
 
     function runtimeFinding(message, line = null, column = null) {
@@ -455,15 +514,17 @@
      * Resolves with { status, errors, output, durationMs, reason? }.
      * status: "finished" | "crashed" | "timeout" | "skipped"
      */
-    function runInSandbox({ code, sourceType, log }) {
+    function runInSandbox({ code, sourceType, checksText, log }) {
       const skipReason = findSkipReason(code, sourceType);
       if (skipReason) return Promise.resolve(skippedRun(skipReason));
+      const parsedChecks = parseChecks(checksText);
 
       return new Promise((resolve) => {
         const startedAt = performance.now();
         const output = [];
-        const errors = [];
-        const url = URL.createObjectURL(new Blob([buildWorkerSource(code)], { type: "text/javascript" }));
+        const errors = [...parsedChecks.problems];
+        const checkResults = [];
+        const url = URL.createObjectURL(new Blob([buildWorkerSource(code, parsedChecks.checks)], { type: "text/javascript" }));
         const worker = new Worker(url, { type: sourceType === "module" ? "module" : "classic" });
         let timeoutTimer = null;
         let settleTimer = null;
@@ -475,7 +536,7 @@
           URL.revokeObjectURL(url);
           const durationMs = Math.round(performance.now() - startedAt);
           log.add(`Sandbox result: ${status} (${durationMs} ms)`);
-          resolve({ status, errors, output, durationMs });
+          resolve({ status, errors, output, durationMs, checkCount: parsedChecks.checks.length });
         }
 
         function recordCrash(finding) {
@@ -490,9 +551,15 @@
             log.add(`console.${data.level}: ${data.text}`);
           } else if (data.type === "error") {
             recordCrash(toRuntimeFinding(data));
+          } else if (data.type === "check") {
+            checkResults.push(data);
+            log.add(`Check ${data.passed ? "passed" : "failed"}: ${parsedChecks.checks[data.index].source}`);
           } else if (data.type === "finished") {
             log.add("Code reached its last line; waiting for delayed errors");
-            settleTimer = setTimeout(() => finish("finished"), SETTLE_MS);
+            settleTimer = setTimeout(() => {
+              errors.push(...failedCheckFindings(checkResults, parsedChecks.checks));
+              finish("finished");
+            }, SETTLE_MS);
           }
         };
 
@@ -514,6 +581,179 @@
       });
     }
 
+    // ---------- Structure checks and call map (no DOM code here) ----------
+
+    const FUNCTION_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+    const isFunction = (node) => Boolean(node) && FUNCTION_TYPES.has(node.type);
+    const isClass = (node) => node.type === "ClassDeclaration" || node.type === "ClassExpression";
+
+    /** Visits every node in the syntax tree. The visitor has `enter(node)` and `leave(node)`. */
+    function walkTree(node, visitor) {
+      visitor.enter(node);
+      for (const value of Object.values(node)) {
+        for (const child of Array.isArray(value) ? value : [value]) {
+          if (child && typeof child.type === "string") walkTree(child, visitor);
+        }
+      }
+      visitor.leave(node);
+    }
+
+    /** How many arguments a function accepts. Parameters with defaults, and rest parameters, are optional. */
+    function argumentRange(fn) {
+      const optionalAt = fn.params.findIndex((p) => p.type === "AssignmentPattern" || p.type === "RestElement");
+      const hasRest = fn.params.some((p) => p.type === "RestElement");
+      return { min: optionalAt === -1 ? fn.params.length : optionalAt, max: hasRest ? Infinity : fn.params.length };
+    }
+
+    /**
+     * Reads the code's structure without running it: which functions exist, which classes have which
+     * methods, and who calls whom. Assumes the code already passed the syntax check.
+     */
+    function analyzeStructure(code, sourceType) {
+      const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
+      const structure = {
+        functions: new Map(),    // name -> { min, max } arguments accepted
+        calls: [],               // calls to plain names: { name, argCount, hasSpread, line, column, owner }
+        methodCalls: [],         // this.method() calls: { cls, method, line, column, owner }
+        nameCounts: new Map(),   // how often each name appears anywhere in the code
+        exported: new Set(),     // names exported from a module
+      };
+      const owners = [];         // functions we are currently inside
+      const classes = [];        // classes we are currently inside
+      const currentClass = () => classes.at(-1);
+      const currentOwner = () => owners.at(-1) ?? "(top level)";
+
+      /** The name a function-like node goes by in the call map, or null if it is not a named function. */
+      function ownerOf(node) {
+        if (node.type === "FunctionDeclaration") return node.id?.name ?? null;
+        if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && isFunction(node.init)) return node.id.name;
+        if (node.type === "MethodDefinition" && !node.computed && node.key.type === "Identifier") {
+          return `${currentClass()?.name}.${node.key.name}`;
+        }
+        return null;
+      }
+
+      function defineFunction(node) {
+        if (node.type === "FunctionDeclaration" && node.id) {
+          structure.functions.set(node.id.name, argumentRange(node));
+        } else if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && isFunction(node.init)) {
+          structure.functions.set(node.id.name, argumentRange(node.init));
+        }
+      }
+
+      function rememberThisAssignment({ left }) {
+        const isThisProperty = left.type === "MemberExpression" && left.object.type === "ThisExpression"
+          && !left.computed && left.property.type === "Identifier";
+        if (isThisProperty) currentClass()?.members.add(left.property.name);
+      }
+
+      function recordCall(node) {
+        const { callee } = node;
+        const where = { line: node.loc.start.line, column: node.loc.start.column + 1, owner: currentOwner() };
+
+        if (callee.type === "Identifier") {
+          const hasSpread = node.arguments.some((argument) => argument.type === "SpreadElement");
+          structure.calls.push({ ...where, name: callee.name, argCount: node.arguments.length, hasSpread });
+        } else if (callee.type === "MemberExpression" && callee.object.type === "ThisExpression"
+                   && !callee.computed && callee.property.type === "Identifier" && currentClass()) {
+          structure.methodCalls.push({ ...where, cls: currentClass(), method: callee.property.name });
+        }
+      }
+
+      function recordExports({ declaration, specifiers = [] }) {
+        const names = [
+          declaration?.id?.name,
+          declaration?.name,
+          ...(declaration?.declarations ?? []).map((declarator) => declarator.id.name),
+          ...specifiers.map((specifier) => specifier.local.name),
+        ];
+        names.filter(Boolean).forEach((name) => structure.exported.add(name));
+      }
+
+      walkTree(ast, {
+        enter(node) {
+          if (node.type === "Identifier") {
+            structure.nameCounts.set(node.name, (structure.nameCounts.get(node.name) ?? 0) + 1);
+          } else if (isClass(node)) {
+            classes.push({ name: node.id?.name ?? "(anonymous class)", members: new Set(), hasParent: Boolean(node.superClass) });
+          } else if (node.type === "MethodDefinition" || node.type === "PropertyDefinition") {
+            if (!node.computed && node.key.type === "Identifier") currentClass()?.members.add(node.key.name);
+          } else if (node.type === "AssignmentExpression") {
+            rememberThisAssignment(node);
+          } else if (node.type === "CallExpression") {
+            recordCall(node);
+          } else if (node.type === "ExportNamedDeclaration" || node.type === "ExportDefaultDeclaration") {
+            recordExports(node);
+          }
+
+          defineFunction(node);
+          const owner = ownerOf(node);
+          if (owner) owners.push(owner);
+        },
+        leave(node) {
+          if (ownerOf(node)) owners.pop();
+          if (isClass(node)) classes.pop();
+        },
+      });
+
+      return structure;
+    }
+
+    function structureFinding(call, message, ruleId, severity) {
+      return { line: call.line, column: call.column, message, ruleId, severity };
+    }
+
+    /**
+     * Suspicious calls found without running anything.
+     * Too many arguments and unknown this.methods are errors; too few arguments is only a note,
+     * because leaving an argument out is sometimes intentional.
+     */
+    function findStructureProblems({ functions, calls, methodCalls, nameCounts }) {
+      const errors = [];
+      const notes = [];
+      const usesArguments = nameCounts.has("arguments");   // such code can accept any number of arguments
+
+      for (const call of calls) {
+        const known = functions.get(call.name);
+        if (!known || call.hasSpread || usesArguments) continue;
+        const given = countLabel(call.argCount, "argument");
+
+        if (call.argCount > known.max) {
+          errors.push(structureFinding(call, `${call.name}() is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
+        } else if (call.argCount < known.min) {
+          notes.push(structureFinding(call, `${call.name}() is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
+        }
+      }
+
+      for (const call of methodCalls) {
+        if (call.cls.hasParent || call.cls.members.has(call.method)) continue;   // inherited members are unknown to us
+        errors.push(structureFinding(call, `this.${call.method}() is called, but ${call.cls.name} has no method or property "${call.method}"`, "zapple/unknown-method", "error"));
+      }
+
+      return { errors, notes };
+    }
+
+    /** A plain-text map of which function calls which, plus the functions nothing uses. */
+    function buildCallMap({ functions, calls, methodCalls, nameCounts, exported }) {
+      const calleesByOwner = new Map();
+      const addCallee = (owner, callee) => {
+        if (!calleesByOwner.has(owner)) calleesByOwner.set(owner, new Set());
+        calleesByOwner.get(owner).add(callee);
+      };
+
+      calls.filter((call) => functions.has(call.name)).forEach((call) => addCallee(call.owner, call.name));
+      methodCalls.forEach((call) => addCallee(call.owner, `this.${call.method}`));
+
+      const lines = [...calleesByOwner].map(([owner, callees]) => `${owner} → ${[...callees].join(", ")}`);
+      for (const name of functions.keys()) {
+        if (!calleesByOwner.has(name)) lines.push(`${name} → (calls no other function here)`);
+      }
+
+      const unused = [...functions.keys()].filter((name) => (nameCounts.get(name) ?? 0) <= 1 && !exported.has(name));
+      if (unused.length > 0) lines.push("", `Never called or referenced: ${unused.join(", ")}`);
+      return lines.join("\n");
+    }
+
     // ---------- Repair prompt (no DOM code here) ----------
 
     const CONTEXT_LINES = 3;   // lines shown above and below the error
@@ -532,6 +772,7 @@
       "- Fix every problem listed and change nothing else. Do not rewrite, rename, reformat, or add features.",
       "- For a name that is not defined, either define it or use the correct name that already exists in the code. Do not delete the code that uses it.",
       "- Problems marked [runtime] crashed when the code was run. Fix the cause of the crash.",
+      "- Problems marked [check] are tests written by the user. The corrected code must pass them.",
       REPLY_RULE,
     ];
 
@@ -607,6 +848,7 @@
     const sourceType  = document.getElementById("source-type");
     const taskInput   = document.getElementById("task-input");
     const globalsInput = document.getElementById("globals-input");
+    const checksInput = document.getElementById("checks-input");
     const resultPanel = document.getElementById("result");
     const checkButton = document.getElementById("check-button");
     const log = createLog(document.getElementById("log-output"));
@@ -722,19 +964,20 @@
     }
 
     function describeRunOutcome(run) {
-      return run.status === "skipped"
-        ? `No errors found. Not run: ${run.reason}`
-        : `No errors found. The code ran without crashing (${run.durationMs} ms).`;
+      if (run.status === "skipped") return `No errors found. Not run: ${run.reason}`;
+      const checks = run.checkCount > 0 ? ` All ${countLabel(run.checkCount, "check")} passed.` : "";
+      return `No errors found. The code ran without crashing (${run.durationMs} ms).${checks}`;
     }
 
-    function buildOutputBox(output) {
+    /** A titled box of preformatted text (used for the call map and the console output). */
+    function buildTextBox(title, text) {
       const box = el("div", "result note");
-      box.append(el("p", "result-title", "Console output"), el("pre", "code-frame", output.join("\n")));
+      box.append(el("p", "result-title", title), el("pre", "code-frame", text));
       return box;
     }
 
     /** Shows errors (with the repair prompt), notes, and what the code printed during the test run. */
-    function showReport({ errors, notes, run, promptText }) {
+    function showReport({ errors, notes, callMap, run, promptText }) {
       const blocks = [];
 
       if (errors.length === 0) {
@@ -745,8 +988,11 @@
       if (notes.length > 0) {
         blocks.push(buildFindingsBox("note", countLabel(notes.length, "note"), notes));
       }
+      if (callMap) {
+        blocks.push(buildTextBox("Call map", callMap));
+      }
       if (run.output.length > 0) {
-        blocks.push(buildOutputBox(run.output));
+        blocks.push(buildTextBox("Console output", run.output.join("\n")));
       }
       if (promptText) {
         blocks.push(buildPromptSection(promptText));
@@ -780,6 +1026,7 @@
         sourceType: sourceType.value,
         task: taskInput.value.trim(),
         extraGlobals: parseNameList(globalsInput.value),
+        checksText: checksInput.value,
       };
       log.add(`Check started: ${request.sourceType}, ${countLabel(request.code.split("\n").length, "line")}`);
 
@@ -801,15 +1048,23 @@
       const lint = lintCode(request);
       log.add(`Rule check: ${countLabel(lint.errors.length, "error")}, ${countLabel(lint.notes.length, "note")}`);
 
-      // Only test-run code that has no rule errors, so the same problem is not reported twice
-      const run = lint.errors.length === 0
+      const structure = analyzeStructure(request.code, request.sourceType);
+      const problems = findStructureProblems(structure);
+      log.add(`Structure check: ${countLabel(structure.functions.size, "function")} found, `
+        + `${countLabel(problems.errors.length, "error")}, ${countLabel(problems.notes.length, "note")}`);
+
+      const staticErrors = [...lint.errors, ...problems.errors];
+      const notes = [...lint.notes, ...problems.notes];
+
+      // Only test-run code that passed the static checks, so the same problem is not reported twice
+      const run = staticErrors.length === 0
         ? await runInSandbox({ ...request, log })
-        : skippedRun("fix the rule errors first.");
+        : skippedRun("fix the errors above first.");
       if (run.status === "skipped") log.add(`Sandbox skipped: ${run.reason}`);
 
-      const errors = [...lint.errors, ...run.errors];
+      const errors = [...staticErrors, ...run.errors];
       const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
-      showReport({ errors, notes: lint.notes, run, promptText });
+      showReport({ errors, notes, callMap: buildCallMap(structure), run, promptText });
     }
 
     function handleClear() {
