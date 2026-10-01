@@ -389,21 +389,28 @@
     }
 
     /**
-     * Reads the code's structure without running it: which functions exist, which classes have which
-     * methods, and who calls whom. Assumes the code already passed the syntax check.
+     * Reads the code's structure without running it: which functions exist (including functions
+     * inside object literals, listed as "service.greet"), which classes have which methods, and
+     * who calls whom. Assumes the code already passed the syntax check.
      */
     function analyzeStructure(code, sourceType) {
       const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
       const structure = {
-        functions: new Map(),    // name -> { min, max } arguments accepted ("service.greet" for object methods)
-        calls: [],               // calls to plain names: { name, argCount, hasSpread, line, column, owner }
-        methodCalls: [],         // this.method() calls: { cls, method, line, column, owner }
-        otherCalls: [],          // calls that can only be traced by guessing: { kind, ..., line, column, owner }
-        classes: new Map(),      // class name -> { name, members, hasParent, parentName }
-        aliases: new Map(),      // const alias = otherName  ->  alias -> otherName
-        declared: new Set(),     // every name this code declares itself (variables, parameters, functions, classes, imports)
-        nameCounts: new Map(),   // how often each name appears anywhere in the code
-        exported: new Set(),     // names exported from a module
+        functions: new Map(),        // name or "service.greet" -> { min, max } arguments accepted
+        calls: [],                   // direct calls to plain names
+        methodCalls: [],             // this.method() calls
+        memberCalls: [],             // obj.method() calls where obj is a plain name
+        superCalls: [],              // super.method() calls
+        newCalls: [],                // new X() calls
+        otherCalls: [],              // calls that can only be traced by guessing
+        classes: new Map(),          // class name -> { name, members, hasParent, parentName }
+        aliases: new Map(),          // alias -> { kind: "name", target } or { kind: "member", object, method }
+        shorthandTargets: new Map(), // "obj.method" written as shorthand { method } -> the outer function name
+        objectMembers: new Map(),    // object literal name -> Set of member names it has
+        declared: new Set(),         // every name this code declares itself
+        nameCounts: new Map(),       // how often each name appears anywhere in the code
+        exported: new Set(),         // names exported from a module
+        callOwners: new Set(),       // owners whose body contains at least one call of any kind
       };
       const owners = [];         // functions we are currently inside
       const classes = [];        // classes we are currently inside
@@ -445,7 +452,18 @@
         }
       }
 
-      /** Remembers every name the code declares, and simple aliases such as const fn = greet. */
+      /** Remembers the members of object literals, including shorthand { greet } -> outer function greet. */
+      function noteObjectMember(node) {
+        if (node.type !== "Property" || node.computed || node.key.type !== "Identifier" || !currentObject()) return;
+        const object = currentObject();
+        if (!structure.objectMembers.has(object)) structure.objectMembers.set(object, new Set());
+        structure.objectMembers.get(object).add(node.key.name);
+        if (node.shorthand && node.value.type === "Identifier") {
+          structure.shorthandTargets.set(`${object}.${node.key.name}`, node.value.name);
+        }
+      }
+
+      /** Remembers every name the code declares, simple aliases (const fn = greet, const fn = obj.m), ... */
       function noteDeclarations(node) {
         const declare = (pattern) => {
           if (!pattern) return;
@@ -463,10 +481,16 @@
           declare(node.id);
           node.params.forEach(declare);
         }
-        if (node.type === "VariableDeclaration" && node.kind === "const") {      // const can never be reassigned, so the alias is safe to follow
+        if (node.type === "VariableDeclaration" && node.kind === "const") {   // const can never be reassigned, so the alias is safe to follow
           for (const declarator of node.declarations) {
-            if (declarator.id.type === "Identifier" && declarator.init?.type === "Identifier") {
-              structure.aliases.set(declarator.id.name, declarator.init.name);
+            if (declarator.id.type !== "Identifier" || !declarator.init) continue;
+            if (declarator.init.type === "Identifier") {
+              structure.aliases.set(declarator.id.name, { kind: "name", target: declarator.init.name });
+            } else if (declarator.init.type === "MemberExpression" && declarator.init.object.type === "Identifier"
+                && !declarator.init.computed && declarator.init.property.type === "Identifier") {
+              structure.aliases.set(declarator.id.name, {
+                kind: "member", object: declarator.init.object.name, method: declarator.init.property.name,
+              });
             }
           }
         }
@@ -481,6 +505,7 @@
       function recordCall(node) {
         const { callee } = node;
         const where = whereOf(node);
+        structure.callOwners.add(where.owner);
 
         for (const argument of node.arguments) {           // a function handed to another call will be called by it
           if (argument.type === "Identifier") structure.otherCalls.push({ ...where, kind: "passed", name: argument.name });
@@ -490,19 +515,21 @@
           const hasSpread = node.arguments.some((argument) => argument.type === "SpreadElement");
           structure.calls.push({ ...where, name: callee.name, argCount: node.arguments.length, hasSpread });
         } else if (callee.type === "MemberExpression") {
-          recordMemberCall(callee, where);
+          recordMemberCall(callee, where, node);
         }
       }
 
-      function recordMemberCall(callee, where) {
+      function recordMemberCall(callee, where, node) {
         const method = !callee.computed && callee.property.type === "Identifier" ? callee.property.name : null;
+        const argCount = node.arguments.length;
+        const hasSpread = node.arguments.some((argument) => argument.type === "SpreadElement");
 
         if (callee.object.type === "ThisExpression" && method && currentClass()) {
-          structure.methodCalls.push({ ...where, cls: currentClass(), method });
+          structure.methodCalls.push({ ...where, cls: currentClass(), method, argCount, hasSpread });
         } else if (callee.object.type === "Super" && method && currentClass()) {
-          structure.otherCalls.push({ ...where, kind: "super", cls: currentClass(), method });
+          structure.superCalls.push({ ...where, cls: currentClass(), method, argCount, hasSpread });
         } else if (callee.object.type === "Identifier" && method) {
-          structure.otherCalls.push({ ...where, kind: "member", object: callee.object.name, method });
+          structure.memberCalls.push({ ...where, object: callee.object.name, method, argCount, hasSpread });
         } else {
           structure.otherCalls.push({ ...where, kind: "dynamic", text: method ? `….${method}()` : "[…]()" });
         }
@@ -536,13 +563,15 @@
           } else if (node.type === "CallExpression") {
             recordCall(node);
           } else if (node.type === "NewExpression" && node.callee.type === "Identifier") {
-            structure.otherCalls.push({ ...whereOf(node), kind: "new", name: node.callee.name });
+            structure.newCalls.push({ ...whereOf(node), name: node.callee.name });
+            structure.callOwners.add(currentOwner());
           } else if (node.type === "ExportNamedDeclaration" || node.type === "ExportDefaultDeclaration") {
             recordExports(node);
           }
 
           noteDeclarations(node);
           defineFunction(node);
+          noteObjectMember(node);
           const objectName = objectNameOf(node);
           if (objectName) objects.push(objectName);
           const owner = ownerOf(node);
@@ -562,25 +591,55 @@
       return { line: call.line, column: call.column, message, ruleId, severity };
     }
 
+    /** What a one-step alias (const fn = greet / const fn = obj.method) ultimately names, or null. */
+    function resolveAliasTarget(aliases, name) {
+      const alias = aliases.get(name);
+      if (!alias) return null;
+      return alias.kind === "name" ? alias.target : `${alias.object}.${alias.method}`;
+    }
+
     /**
      * Suspicious calls found without running anything.
-     * Too many arguments and unknown this.methods are errors; too few arguments is only a note,
-     * because leaving an argument out is sometimes intentional.
+     * Too many arguments and unknown this.methods / obj.methods are errors; too few arguments is only a note,
+     * because leaving an argument out is sometimes intentional. Best-guess links never produce argument errors.
      */
-    function findStructureProblems({ functions, calls, methodCalls, nameCounts }) {
+    function findStructureProblems({ functions, calls, memberCalls, methodCalls, aliases, shorthandTargets, nameCounts }) {
       const errors = [];
       const notes = [];
       const usesArguments = nameCounts.has("arguments");   // such code can accept any number of arguments
 
       for (const call of calls) {
-        const known = functions.get(call.name);
+        const aliased = resolveAliasTarget(aliases, call.name);
+        const known = functions.get(call.name) ?? (aliased ? functions.get(aliased) : undefined);
+        if (!known || call.hasSpread || usesArguments) continue;
+        const given = countLabel(call.argCount, "argument");
+        const label = aliased ? `${call.name}() (alias for ${aliased}())` : `${call.name}()`;
+
+        if (call.argCount > known.max) {
+          errors.push(structureFinding(call, `${label} is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
+        } else if (call.argCount < known.min) {
+          notes.push(structureFinding(call, `${label} is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
+        }
+      }
+
+      for (const call of memberCalls) {
+        const key = `${call.object}.${call.method}`;
+        let known = functions.get(key);
+        let label = `${key}()`;
+        if (!known) {                       // shorthand { greet } calls the outer function greet
+          const shorthand = shorthandTargets.get(key);
+          if (shorthand && functions.has(shorthand)) {
+            known = functions.get(shorthand);
+            label = `${key}() (shorthand for ${shorthand}())`;
+          }
+        }
         if (!known || call.hasSpread || usesArguments) continue;
         const given = countLabel(call.argCount, "argument");
 
         if (call.argCount > known.max) {
-          errors.push(structureFinding(call, `${call.name}() is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
+          errors.push(structureFinding(call, `${label} is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
         } else if (call.argCount < known.min) {
-          notes.push(structureFinding(call, `${call.name}() is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
+          notes.push(structureFinding(call, `${label} is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
         }
       }
 
@@ -611,7 +670,8 @@
      * Returns the call map as text, plus counts for the Insight layer.
      */
     function buildCallMap(structure) {
-      const { functions, calls, methodCalls, otherCalls, classes, aliases, declared, nameCounts, exported } = structure;
+      const { functions, calls, methodCalls, memberCalls, superCalls, newCalls, otherCalls, classes, aliases,
+        shorthandTargets, declared, nameCounts, exported, callOwners } = structure;
       const byOwner = new Map();
       const entryFor = (owner) => {
         if (!byOwner.has(owner)) byOwner.set(owner, { followed: new Set(), guessed: new Set(), builtIn: new Set(), notFollowed: [] });
@@ -626,7 +686,7 @@
       };
 
       for (const call of calls) {
-        const aliased = aliases.get(call.name);
+        const aliased = resolveAliasTarget(aliases, call.name);
         if (functions.has(call.name)) entryFor(call.owner).followed.add(call.name);
         else if (aliased && functions.has(aliased)) entryFor(call.owner).followed.add(`${aliased} (through ${call.name})`);
         else if (declared.has(call.name)) notFollowed(call, `${call.name}()`, "variable");
@@ -635,51 +695,93 @@
 
       for (const call of methodCalls) entryFor(call.owner).followed.add(`this.${call.method}`);
 
+      for (const call of memberCalls) {
+        const key = `${call.object}.${call.method}`;
+        const entry = entryFor(call.owner);
+        const shorthand = shorthandTargets.get(key);
+        if (functions.has(key)) entry.followed.add(key);
+        else if (shorthand && functions.has(shorthand)) entry.guessed.add(`${shorthand}? (through ${key})`);
+        else if (!declared.has(call.object) || BUILT_IN_METHODS.has(call.method)) entry.builtIn.add(`${key}()`);
+        else {
+          const guess = onlyClassWith(call.method);
+          if (guess) entry.guessed.add(`${guess}.${call.method}?`);
+          else notFollowed(call, `${key}()`, "member");
+        }
+      }
+
+      for (const call of superCalls) {
+        const parent = classes.get(call.cls.parentName);
+        if (parent?.members.has(call.method)) entryFor(call.owner).followed.add(`${parent.name}.${call.method}`);
+        else notFollowed(call, `super.${call.method}()`, "super");
+      }
+
+      for (const call of newCalls) {
+        const entry = entryFor(call.owner);
+        if (classes.has(call.name) || functions.has(call.name)) entry.followed.add(`new ${call.name}`);
+        else if (!declared.has(call.name)) entry.builtIn.add(`new ${call.name}`);
+      }
+
       for (const call of otherCalls) {
         const entry = entryFor(call.owner);
         if (call.kind === "passed") {
           if (functions.has(call.name)) entry.followed.add(`${call.name} (passed along)`);
-        } else if (call.kind === "new") {
-          if (classes.has(call.name) || functions.has(call.name)) entry.followed.add(`new ${call.name}`);
-          else if (!declared.has(call.name)) entry.builtIn.add(`new ${call.name}`);
-        } else if (call.kind === "super") {
-          const parent = classes.get(call.cls.parentName);
-          if (parent?.members.has(call.method)) entry.followed.add(`${parent.name}.${call.method}`);
-          else notFollowed(call, `super.${call.method}()`, "super");
-        } else if (call.kind === "member") {
-          const key = `${call.object}.${call.method}`;
-          const guess = onlyClassWith(call.method);
-          if (functions.has(key)) entry.followed.add(key);
-          else if (!declared.has(call.object) || BUILT_IN_METHODS.has(call.method)) entry.builtIn.add(`${key}()`);
-          else if (guess) entry.guessed.add(`${guess}.${call.method}?`);
-          else notFollowed(call, `${key}()`, "member");
         } else {
           notFollowed(call, call.text, "dynamic");
         }
       }
 
+      // Names that count as "used": call targets, member names, alias targets, constructors
+      const usedShortNames = new Set();
+      for (const call of calls) usedShortNames.add(call.name);
+      for (const call of memberCalls) { usedShortNames.add(call.method); usedShortNames.add(call.object); }
+      for (const call of methodCalls) usedShortNames.add(call.method);
+      for (const call of superCalls) usedShortNames.add(call.method);
+      for (const call of newCalls) usedShortNames.add(call.name);
+      for (const alias of aliases.values()) {
+        if (alias.kind === "name") usedShortNames.add(alias.target);
+        else { usedShortNames.add(alias.object); usedShortNames.add(alias.method); }
+      }
+
       const lines = [];
       for (const [owner, entry] of byOwner) {
         const targets = [...entry.followed, ...entry.guessed];
-        lines.push(targets.length > 0 ? `${owner} → ${targets.join(", ")}` : owner);
+        if (targets.length > 0) {
+          lines.push(`${owner} → ${targets.join(", ")}`);
+        } else {
+          // Grounded wording: say "no calls here" only when the body truly contains no calls at all
+          const madeCalls = callOwners.has(owner) || entry.notFollowed.length > 0 || entry.builtIn.size > 0;
+          lines.push(madeCalls ? `${owner} (no calls Zapple could identify)` : `${owner} (no calls here)`);
+        }
         for (const item of entry.notFollowed) lines.push(`    ? ${item.text}  not followed, ${item.why} (line ${item.line})`);
         if (entry.builtIn.size > 0) lines.push(`    · built-in or library: ${[...entry.builtIn].join(", ")}`);
       }
       for (const name of functions.keys()) {
-        if (!byOwner.has(name)) lines.push(`${name}  (no calls found)`);
+        if (byOwner.has(name)) continue;
+        lines.push(callOwners.has(name) ? `${name} (no calls Zapple could identify)` : `${name} (no calls here)`);
       }
 
+      // A function is "used" when its short name appears anywhere else in the code (or via aliases / member calls)
+      const unused = [...functions.keys()].filter((name) => {
+        const short = name.split(".").pop();
+        return (nameCounts.get(short) ?? 0) <= 1 && !usedShortNames.has(short) && !exported.has(name);
+      });
+
       const sum = (key) => [...byOwner.values()].reduce((total, entry) => total + (entry[key].size ?? entry[key].length), 0);
+      const notFollowedList = [...byOwner.values()].flatMap((entry) => entry.notFollowed);
       const stats = {
         functions: functions.size, followed: sum("followed"), guessed: sum("guessed"),
-        notFollowed: sum("notFollowed"), builtIn: sum("builtIn"), never: 0,
+        notFollowed: notFollowedList.length, builtIn: sum("builtIn"), never: unused.length,
+        notFollowedSamples: notFollowedList.slice(0, 3).map((item) => item.text),
       };
 
-      // A function written inside an object is "used" when its short name appears anywhere else in the code
-      const unused = [...functions.keys()].filter((name) => (nameCounts.get(name.split(".").pop()) ?? 0) <= 1 && !exported.has(name));
-      stats.never = unused.length;
       if (unused.length > 0) lines.push("", `Never called or referenced: ${unused.join(", ")}`);
-      if (stats.guessed > 0) lines.push("", "A name ending in ? is a guess: only one class in this code has a method with that name.");
+      if (stats.guessed > 0) {
+        lines.push("", "A name ending in ? is a best guess: only one place in this code has that name, so Zapple links it, but it cannot prove it.");
+      }
+      if (stats.notFollowed > 0) {
+        lines.push("", "Some calls could not be traced by reading the code. They are listed under the calling function with a '?'. "
+          + "Only direct calls, this.method(), known object methods and one-step aliases (const fn = greet) are followed.");
+      }
 
       return { text: lines.join("\n"), stats };
     }
@@ -1026,6 +1128,7 @@ class CallWalker:
         self.not_followed = {}     # owner -> [(text, why, line)] calls whose target Zapple could not tell
         self.built_in = {}         # owner -> built-in or library calls, which are not part of this code
         self.plain_called = set()
+        self.any_calls = set()          # owners whose body contains at least one call of any kind
         self.method_owners = {}    # method name -> classes that define it (for best-guess links)
         for info in structure.classes.values():
             for name in info.methods:
@@ -1066,6 +1169,7 @@ class CallWalker:
 
     def check_call(self, call, owner, cls, self_name, scopes):
         target = call.func
+        self.any_calls.add(owner)
         self.note_functions_passed(call, owner, scopes)
         if isinstance(target, ast.Name):
             if target.id == "cls" and cls is not None:      # inside a classmethod, cls(...) builds this class
@@ -1201,7 +1305,11 @@ def build_call_map(structure, walker, check_names):
     every_function = [n for n, found in structure.plain_defs.items()
                       for d, _ in found if isinstance(d, FUNCTION_NODES)]
     every_function += [f"{i.name}.{n}" for i in structure.classes.values() for n in i.methods]
-    lines += [f"{name} → (calls no other function here)" for name in every_function if name not in walker.callees]
+    for name in every_function:
+        if name in walker.callees:
+            continue
+        made_calls = name in walker.any_calls or name in walker.built_in
+        lines.append(f"{name} (no calls Zapple could identify)" if made_calls else f"{name} (no calls here)")
 
     unused = unused_names(structure, check_names)
     if unused:
@@ -1210,6 +1318,9 @@ def build_call_map(structure, walker, check_names):
             lines.append("(This code looks names up by text, for example with getattr, so some of these may be used that way.)")
     if any(callee.endswith("?") for callees in walker.callees.values() for callee in callees):
         lines += ["", "? = a best guess: only one class in this code has a method with that name."]
+    if any(walker.not_followed.values()):
+        lines += ["", "Some calls could not be traced by reading the code. They are listed under the calling function. "
+                       "Only direct calls, self.method(), known object methods and one-step aliases are followed."]
     return "\n".join(lines)
 
 def check_names_used(check_lines):
@@ -1233,13 +1344,14 @@ def analyze_structure(tree, check_lines):
     errors = sorted(walker.errors, key=lambda f: (f["line"], f["column"]))
     call_map = build_call_map(structure, walker, check_names_used(check_lines))
     definitions = sum(len(found) for found in structure.plain_defs.values())
-    return errors, call_map, definitions
+    untraced = sum(len(items) for items in walker.not_followed.values())
+    return errors, call_map, definitions, untraced
 
 async def analyze(request):
     code, blanked = blank_notebook_lines(request["code"])
     result = {"blanked": blanked, "syntax": None, "errors": [], "notes": [], "skipReason": None,
               "output": [], "runErrors": [], "checkCount": 0,
-              "callMap": "", "structureCount": 0, "structureFailed": None}
+              "callMap": "", "structureCount": 0, "untracedCalls": 0, "structureFailed": None}
 
     try:
         tree = ast.parse(code)
@@ -1256,7 +1368,7 @@ async def analyze(request):
                              key=lambda f: f["line"] or 0)
 
     try:
-        problems, result["callMap"], result["structureCount"] = analyze_structure(tree, request["checks"])
+        problems, result["callMap"], result["structureCount"], result["untracedCalls"] = analyze_structure(tree, request["checks"])
         result["errors"] = sorted(result["errors"] + problems, key=lambda f: f["line"] or 0)
     except Exception as error:            # a bug in the structure checks must never stop the other checks
         result["structureFailed"] = f"{type(error).__name__}: {error}"

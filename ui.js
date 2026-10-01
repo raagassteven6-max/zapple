@@ -144,9 +144,44 @@ function buildTextBox(title, text) {
   return box;
 }
 
+/** Plain-language summary of what Zapple found, on top of the technical output. */
+function buildInsightBox({ errors, notes, run, untraced }) {
+  const lines = [];
+
+  if (errors.length > 0) {
+    lines.push(`${countLabel(errors.length, "problem")} found. The technical list is below, `
+      + "and a ready-made repair prompt you can paste to an AI is included at the end.");
+  } else {
+    lines.push("No problems were found by any check.");
+  }
+
+  if (run.status === "skipped") {
+    lines.push(`The test run was skipped: ${run.reason}`);
+  } else if (errors.length === 0) {
+    const checks = run.checkCount > 0 ? ` All ${countLabel(run.checkCount, "check")} passed.` : "";
+    lines.push(`The code ran without crashing (${run.durationMs} ms).${checks}`);
+  } else {
+    lines.push("The test run did not happen because errors were found earlier; fix those first.");
+  }
+
+  if (untraced.count > 0) {
+    const example = untraced.samples.length > 0 ? ` (for example ${untraced.samples.join(", ")})` : "";
+    lines.push(`${countLabel(untraced.count, "call")} could not be traced by reading the code${example}. `
+      + "The runtime section below shows what actually executed.");
+  }
+
+  if (notes.length > 0) {
+    lines.push(`${countLabel(notes.length, "note")}: worth a look, but not necessarily mistakes.`);
+  }
+
+  const box = el("div", "result note");
+  box.append(el("p", "result-title", "Insight"), el("p", "result-detail", lines.join("\n")));
+  return box;
+}
+
 /** Shows errors (with the repair prompt), notes, and what the code printed during the test run. */
-function showReport({ errors, notes, callMap, run, promptText }) {
-  const blocks = [];
+function showReport({ errors, notes, callMap, run, promptText, untraced = { count: 0, samples: [] } }) {
+  const blocks = [buildInsightBox({ errors, notes, run, untraced })];
 
   if (errors.length === 0) {
     blocks.push(buildMessageBox("ok", "OK", describeRunOutcome(run)));
@@ -196,7 +231,7 @@ async function checkPython(request) {
     const seconds = RUN_TIMEOUT_MS / 1000;
     log.add(`Timeout: the code did not finish within ${seconds} s. Python was stopped and restarts on the next check`);
     const errors = [runtimeFinding(`The code did not finish within ${seconds} seconds (possible infinite loop or endless wait)`)];
-    showReport({ errors, notes: [], callMap: "", run: skippedRun(), promptText: buildLintPrompt({ ...request, errors }) });
+    showReport({ errors, notes: [], callMap: "", run: skippedRun(), promptText: buildLintPrompt({ ...request, errors }), untraced: { count: 0, samples: [] } });
     return;
   }
 
@@ -235,7 +270,10 @@ async function checkPython(request) {
 
   const errors = [...analysis.errors, ...run.errors];
   const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
-  showReport({ errors, notes: analysis.notes, callMap: analysis.callMap, run, promptText });
+  showReport({
+    errors, notes: analysis.notes, callMap: analysis.callMap, run, promptText,
+    untraced: { count: analysis.untracedCalls ?? 0, samples: [] },
+  });
 }
 
 /**
@@ -248,7 +286,8 @@ function checkStructureSafely(request) {
     const problems = findStructureProblems(structure);
     log.add(`Structure check: ${countLabel(structure.functions.size, "function")} found, `
       + `${countLabel(problems.errors.length, "error")}, ${countLabel(problems.notes.length, "note")}`);
-    return { problems, callMap: buildCallMap(structure) };
+    const callMapResult = buildCallMap(structure);
+    return { problems, callMap: callMapResult.text, untraced: { count: callMapResult.stats.notFollowed, samples: callMapResult.stats.notFollowedSamples } };
   } catch (error) {
     log.add(`Structure check could not finish (${error.message}). The other checks still ran`);
     return { problems: { errors: [], notes: [] }, callMap: "" };
@@ -324,7 +363,7 @@ async function handleCheck() {
 
   const errors = [...staticErrors, ...run.errors];
   const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
-  showReport({ errors, notes, callMap: structure.callMap, run, promptText });
+  showReport({ errors, notes, callMap: structure.callMap, run, promptText, untraced: structure.untraced });
 }
 
 function handleClear() {
