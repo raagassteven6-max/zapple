@@ -85,9 +85,14 @@
   }
 
   // Your code calls this: setBotState("checking" | "pass" | "fail" | "cantrun" | "idle", optionalMessage)
+  const IDLE_AFTER_MS = 6000;  // how long a result (pass, fail, cantrun) stays before the bot relaxes
+  let idleT;
   window.setBotState = function (s, msg) {
+    clearTimeout(idleT);
     state = s; buddy.dataset.state = s; step = 0;
     if (s !== "idle") say(msg || pick(LINES[s]));
+    // Any result state returns to idle on its own. "checking" is excluded: a result always follows it.
+    if (s !== "idle" && s !== "checking") idleT = setTimeout(() => window.setBotState("idle"), IDLE_AFTER_MS);
     loop();
   };
 
