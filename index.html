@@ -245,7 +245,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/acorn@8.11.3/dist/acorn.js"></script>
   <!-- ESLint's rule engine, bundled for browsers. Exposes the global `eslint`. -->
-  <script src="https://cdn.jsdelivr.net/npm/eslint-linter-browserify@9/linter.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/eslint-linter-browserify@9.37.0/linter.js"></script>
   <script>
     "use strict";
 
@@ -388,6 +388,10 @@
     const SETTLE_MS = 500;          // after the last line, wait for delayed errors (timers, promises)
     const MAX_OUTPUT_LINES = 200;
 
+    // Browser features that code under test must not use: network access and stored data.
+    // Both the JavaScript and the Python test areas block these same names.
+    const BLOCKED_BROWSER_APIS = ["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "importScripts", "indexedDB", "caches"];
+
     // Names that only exist on a web page, so a worker cannot run code that uses them.
     const PAGE_ONLY_NAMES = new Set(["document", "window", "localStorage", "sessionStorage", "alert", "confirm", "prompt"]);
 
@@ -395,7 +399,7 @@
      * Runs first inside the worker (it is copied into the worker as text).
      * It captures console output, reports crashes, and blocks network and storage access.
      */
-    function workerSetup() {
+    function workerSetup(blockedNames) {
       const send = (message) => self.postMessage(message);
 
       const describe = (value) => {
@@ -409,7 +413,7 @@
         console[level] = (...args) => send({ type: "console", level, text: args.map(describe).join(" ") });
       }
 
-      for (const name of ["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "importScripts", "indexedDB", "caches"]) {
+      for (const name of blockedNames) {
         Object.defineProperty(self, name, {
           get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
         });
@@ -434,7 +438,7 @@
       });
     }
 
-    const WORKER_PREAMBLE = `(${workerSetup.toString()})();`;
+    const WORKER_PREAMBLE = `(${workerSetup.toString()})(${JSON.stringify(BLOCKED_BROWSER_APIS)});`;
     const PREAMBLE_LINES = WORKER_PREAMBLE.split("\n").length;   // user code starts on the next line
 
     function buildWorkerSource(code, checks) {
@@ -789,11 +793,11 @@
     const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
     const PYTHON_LOAD_TIMEOUT_MS = 90000;
 
-    const PYTHON_SKIP_TIP = "The syntax and undefined-name checks above still apply to this code. Running it for real would need those packages installed, which is what the planned remote runner is for.";
+    const PYTHON_SKIP_TIP = "The syntax, undefined-name and structure checks above still apply to this code. Running it for real needs a fuller Python than a browser can offer (extra packages, threads), which is what the planned remote runner is for.";
 
     // The Python that does the actual checking. It runs inside the worker and returns one result per check.
     const PYTHON_SOURCE = String.raw`
-import ast, contextlib, io, json, re, sys, time, traceback
+import ast, contextlib, copy, inspect, io, json, re, sys, time, traceback
 from pyflakes.checker import Checker
 
 # pyflakes finding types that mean the code is wrong. Every other type is only a note.
@@ -838,18 +842,48 @@ def crash_finding(error):
         line = getattr(error, "lineno", None)
     return finding(f"{type(error).__name__}: {error}", line, None, "runtime")
 
-def run_code(tree):
-    """Runs the code. Returns (variables it created, lines it printed, crash or None)."""
+class AsyncRunRewriter(ast.NodeTransformer):
+    """Zapple's Python already has an event loop running, so asyncio.run(x) cannot start a second one.
+    Outside functions, asyncio.run(x) is swapped for 'await x', which does the same job here."""
+    def visit_FunctionDef(self, node):
+        return node                       # 'await' is only allowed outside functions, so leave functions alone
+    visit_AsyncFunctionDef = visit_Lambda = visit_ClassDef = visit_FunctionDef
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        func = node.func
+        is_asyncio_run = (isinstance(func, ast.Attribute) and func.attr == "run"
+                          and isinstance(func.value, ast.Name) and func.value.id == "asyncio")
+        if is_asyncio_run and len(node.args) == 1 and not node.keywords:
+            return ast.copy_location(ast.Await(value=node.args[0]), node)
+        return node
+
+def environment_limit(error, outside):
+    """Why a crash comes from Zapple's browser-based Python rather than from the user's code, or None."""
+    if isinstance(error, ModuleNotFoundError) and (error.name or "").split(".")[0] in outside:
+        return (f"it imports {error.name}, which is not part of standard Python. "
+                "Zapple's Python runs inside your browser and only has the standard library for now.")
+    if "can't start new thread" in str(error):
+        return ("it starts threads (for example with ThreadPoolExecutor). Zapple's Python runs inside your browser, "
+                "which does not allow threads, so this code cannot run here even if it is correct.")
+    return None
+
+async def run_code(tree):
+    """Runs the code. Returns (variables it created, lines it printed, the error it raised or None)."""
     namespace = {"__name__": "__main__"}
     printed = io.StringIO()
     crash = None
     try:
+        rewritten = ast.fix_missing_locations(AsyncRunRewriter().visit(copy.deepcopy(tree)))
+        compiled = compile(rewritten, "<user code>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
-            exec(compile(tree, "<user code>", "exec"), namespace)
+            outcome = eval(compiled, namespace)
+            if inspect.iscoroutine(outcome):      # the code used 'await' (or asyncio.run) at the top level
+                await outcome
     except SystemExit:
         pass
     except BaseException as error:
-        crash = crash_finding(error)
+        crash = error
     return namespace, printed.getvalue().splitlines()[:MAX_OUTPUT_LINES], crash
 
 def run_checks(check_lines, namespace):
@@ -876,10 +910,405 @@ def run_checks(check_lines, namespace):
             findings.append(finding(f"Check failed{detail}: {source}", rule="check"))
     return findings, total
 
-def analyze(request):
+# ---------- Structure checks and call map ----------
+# Reads the code's shape without running it. Only names that are defined exactly once, and never reused
+# as a variable or parameter, are checked. That gives up a few real catches to avoid false alarms.
+
+FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+SCOPE_NODES = FUNCTION_NODES + (ast.Lambda,)
+OBJECT_BASES = {"object"}
+
+# Method names Python itself calls (the import system), so a class defining them is not "never called"
+IMPORT_HOOKS = {"find_spec", "find_module", "create_module", "exec_module", "load_module"}
+
+# Method names of built-in types; a call to one of these is not guessed to belong to a user class
+COMMON_METHODS = set(dir(list)) | set(dir(dict)) | set(dir(str)) | set(dir(set)) | set(dir(bytes))
+
+def mutable_default_notes(tree):
+    """A list, dict or set written as a default value is created once and shared by every call."""
+    notes = []
+    for node in ast.walk(tree):
+        if not isinstance(node, SCOPE_NODES):
+            continue
+        for default in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+            is_literal = isinstance(default, (ast.List, ast.Dict, ast.Set))
+            is_constructor = (isinstance(default, ast.Call) and isinstance(default.func, ast.Name)
+                              and default.func.id in ("list", "dict", "set"))
+            if is_literal or is_constructor:
+                notes.append(finding("A default value that is a list, dict or set is created once and shared by every call of the function",
+                                     default.lineno, default.col_offset + 1, "zapple/mutable-default", "note"))
+    return notes
+
+def is_dunder(name):
+    return name.startswith("__") and name.endswith("__")
+
+def first_param(fn):
+    params = fn.args.posonlyargs + fn.args.args
+    return params[0].arg if params else None
+
+def count_label(count, noun):
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+def names_in(items):
+    return ", ".join(f'"{item}"' for item in items)
+
+class ClassInfo:
+    """What one class definition offers: its methods, its attributes, and whether we can trust that list."""
+    def __init__(self, node):
+        self.node = node
+        self.name = node.name
+        self.methods = {}          # method name -> [definitions]
+        self.members = set()       # every name an instance may have
+        self.decorated = bool(node.decorator_list)
+        has_base = any(not (isinstance(b, ast.Name) and b.id in OBJECT_BASES) for b in node.bases)
+        self.has_parent = has_base or bool(node.keywords)   # inherited members cannot be seen from this file
+        self.dynamic = False       # the class adds names at run time (setattr, __getattr__, __dict__)
+        self.set_on_self = set()   # attributes assigned through self.name = ...
+
+class Structure:
+    """Everything the structure checks need, collected in one walk over the syntax tree."""
+    def __init__(self, tree):
+        self.plain_defs = {}       # name -> [(definition, enclosing function or None)]
+        self.rebound = set()       # names used as variables, parameters, imports and so on
+        self.classes = {}          # ClassDef node -> ClassInfo
+        self.referenced = set()    # names and attributes that are read somewhere
+        self.uses_dynamic_lookup = False
+        self._collect(tree, None)
+
+    def _collect(self, node, scope, class_node=None):
+        """Walks the tree. class_node is set only for the direct children of a class body."""
+        if isinstance(node, FUNCTION_NODES + (ast.ClassDef,)):
+            if class_node is None:
+                self.plain_defs.setdefault(node.name, []).append((node, scope))
+            elif isinstance(node, FUNCTION_NODES):
+                self.classes[class_node].methods.setdefault(node.name, []).append(node)
+        self._note_names(node)
+
+        if isinstance(node, ast.ClassDef):
+            self.classes[node] = ClassInfo(node)
+            self._note_class_body(node, self.classes[node])
+            for child in ast.iter_child_nodes(node):
+                self._collect(child, scope, node)
+            return
+
+        child_scope = node if isinstance(node, SCOPE_NODES) else scope
+        for child in ast.iter_child_nodes(node):
+            self._collect(child, child_scope)
+
+    def _note_names(self, node):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                self.referenced.add(node.id)
+                if node.id in ("getattr", "globals", "locals", "setattr", "vars", "eval", "exec"):
+                    self.uses_dynamic_lookup = True
+            else:
+                self.rebound.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.ctx, ast.Load):
+                self.referenced.add(node.attr)
+            if node.attr == "__dict__":
+                self.uses_dynamic_lookup = True
+        elif isinstance(node, ast.arg):
+            self.rebound.add(node.arg)
+        elif isinstance(node, ast.alias):
+            self.rebound.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            self.rebound.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            self.rebound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            self.rebound.add(node.rest)
+
+    def _note_class_body(self, node, info):
+        """Records the names a class defines directly and the attributes its methods assign on self."""
+        for statement in node.body:
+            if isinstance(statement, FUNCTION_NODES + (ast.ClassDef,)):
+                info.members.add(statement.name)
+            for target in ast.walk(statement) if not isinstance(statement, FUNCTION_NODES) else ():
+                if isinstance(target, ast.Name) and not isinstance(target.ctx, ast.Load):
+                    info.members.add(target.id)
+        self_names = {first_param(m) for m in node.body if isinstance(m, FUNCTION_NODES)} - {None}
+        for inner in ast.walk(node):
+            is_self_attribute = (isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name)
+                                 and inner.value.id in self_names)
+            if is_self_attribute and not isinstance(inner.ctx, ast.Load):
+                info.members.add(inner.attr)
+                info.set_on_self.add(inner.attr)
+            if isinstance(inner, ast.Name) and inner.id in ("setattr", "__getattr__", "__getattribute__"):
+                info.dynamic = True
+            if isinstance(inner, ast.Attribute) and inner.attr == "__dict__":
+                info.dynamic = True
+        if "__getattr__" in info.members or "__getattribute__" in info.members:
+            info.dynamic = True
+
+    def single_definition(self, name):
+        """The one function or class this name means, or None when the name is ambiguous."""
+        found = self.plain_defs.get(name, [])
+        if len(found) != 1 or name in self.rebound:
+            return None
+        return found[0]
+
+def build_signature(fn, drop_first):
+    """What a function accepts, in a form that is easy to compare with a call. None if it cannot be judged."""
+    args = fn.args
+    positional = args.posonlyargs + args.args
+    required_count = len(positional) - len(args.defaults)
+    if drop_first:
+        if not positional:
+            return None
+        positional, required_count = positional[1:], max(0, required_count - 1)
+        posonly = {a.arg for a in args.posonlyargs[1:]}
+    else:
+        posonly = {a.arg for a in args.posonlyargs}
+    names = [a.arg for a in positional]
+    return {
+        "names": names,
+        "required": names[:required_count],
+        "max_positional": float("inf") if args.vararg else len(names),
+        "keyword_ok": {n for n in names if n not in posonly} | {a.arg for a in args.kwonlyargs},
+        "posonly": posonly,
+        "required_keyword_only": [a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is None],
+        "takes_any_keyword": args.kwarg is not None,
+    }
+
+def call_problems(call, signature, label):
+    """Messages describing every way this call does not fit the signature. Calls using * or ** are not judged."""
+    if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+        return []
+    problems = []
+    given = len(call.args)
+    if given > signature["max_positional"]:
+        limit = signature["max_positional"]
+        accepts = "accepts none" if limit == 0 else f"accepts only {limit}"
+        problems.append(("too-many-arguments", f"{label} is called with {count_label(given, 'positional argument')} but {accepts}"))
+        return problems
+
+    filled = set(signature["names"][:given])
+    for keyword in call.keywords:
+        if keyword.arg in filled:
+            problems.append(("duplicate-argument", f'{label} gets two values for "{keyword.arg}" (by position and by name)'))
+        elif keyword.arg in signature["keyword_ok"]:
+            filled.add(keyword.arg)
+        elif keyword.arg in signature["posonly"]:
+            problems.append(("unknown-keyword", f'{label} cannot take "{keyword.arg}" by name (it is positional-only)'))
+        elif not signature["takes_any_keyword"]:
+            problems.append(("unknown-keyword", f'{label} has no argument named "{keyword.arg}"'))
+
+    missing = [n for n in signature["required"] + signature["required_keyword_only"] if n not in filled]
+    if missing:
+        problems.append(("missing-arguments", f"{label} is missing required {'argument' if len(missing) == 1 else 'arguments'} {names_in(missing)}"))
+    return problems
+
+def constructor_signature(info):
+    """What calling the class itself accepts, or None when we cannot tell."""
+    if info.decorated or info.has_parent:
+        return None
+    customized = [n for n in ("__new__", "__init_subclass__") if n in info.members]
+    if customized or "__call__" in info.methods:
+        return None
+    if "__init__" not in info.members:
+        return build_signature(ast.parse("def __init__(self): pass").body[0], True)   # accepts nothing
+    definitions = info.methods.get("__init__", [])
+    if len(definitions) != 1 or definitions[0].decorator_list:
+        return None
+    return build_signature(definitions[0], True)
+
+def finding_for(call, problem):
+    rule, message = problem
+    return finding(message, call.lineno, call.col_offset + 1, "zapple/" + rule)
+
+class CallWalker:
+    """Visits every call with its surroundings: the enclosing function, class and function scopes."""
+    def __init__(self, structure):
+        self.structure = structure
+        self.errors = []
+        self.callees = {}          # owner -> ordered callees, for the call map
+        self.plain_called = set()
+        self.method_owners = {}    # method name -> classes that define it (for best-guess links)
+        for info in structure.classes.values():
+            for name in info.methods:
+                self.method_owners.setdefault(name, []).append(info.name)
+
+    def visit(self, node, owner, cls, self_name, scopes):
+        if isinstance(node, ast.ClassDef):
+            cls, self_name = self.structure.classes[node], None
+            for child in ast.iter_child_nodes(node):
+                self.visit(child, owner, cls, self_name, scopes)
+            return
+
+        if isinstance(node, SCOPE_NODES):
+            in_class = cls is not None and node in cls.node.body
+            if isinstance(node, FUNCTION_NODES):
+                owner = f"{cls.name}.{node.name}" if in_class else node.name
+            if in_class:
+                self_name = None if node.decorator_list else first_param(node)
+            elif self_name in {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg)}:
+                self_name = None                     # a parameter hides self inside this function
+            scopes = scopes + [node]
+            for child in ast.iter_child_nodes(node):
+                self.visit(child, owner, cls, self_name, scopes)
+            return
+
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                self.note_property_setter(target, owner, cls, self_name)
+        if isinstance(node, ast.Call):
+            self.check_call(node, owner, cls, self_name, scopes)
+        for child in ast.iter_child_nodes(node):
+            self.visit(child, owner, cls, self_name, scopes)
+
+    def add_callee(self, owner, callee):
+        self.callees.setdefault(owner, [])
+        if callee not in self.callees[owner]:
+            self.callees[owner].append(callee)
+
+    def check_call(self, call, owner, cls, self_name, scopes):
+        target = call.func
+        self.note_functions_passed(call, owner, scopes)
+        if isinstance(target, ast.Name):
+            if target.id == "cls" and cls is not None:      # inside a classmethod, cls(...) builds this class
+                self.add_callee(owner, cls.name)
+            self.check_plain_call(call, target.id, owner, scopes)
+        elif isinstance(target, ast.Attribute):
+            if isinstance(target.value, ast.Name) and cls is not None and self_name and target.value.id == self_name:
+                self.add_callee(owner, f"{self_name}.{target.attr}")
+                self.check_method_call(call, target.attr, cls)
+            elif cls is not None and self.is_super_call(target.value):
+                self.add_callee(owner, self.super_target(cls, target.attr))
+            else:
+                self.guess_method_target(target.attr, owner)
+
+    @staticmethod
+    def is_super_call(node):
+        return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "super"
+
+    def super_target(self, cls, method):
+        """The parent method a super() call most likely reaches, or 'super().method' if the parent is not in this file."""
+        for base in cls.node.bases:
+            found = self.structure.single_definition(base.id) if isinstance(base, ast.Name) else None
+            if found and isinstance(found[0], ast.ClassDef) and method in self.structure.classes[found[0]].methods:
+                return f"{found[0].name}.{method}"
+        return f"super().{method}"
+
+    def note_functions_passed(self, call, owner, scopes):
+        """A function handed to another call (executor.submit(task), map(task, items)) will be called by it."""
+        for argument in call.args + [k.value for k in call.keywords]:
+            if isinstance(argument, ast.Name):
+                visible = [d for d, scope in self.structure.plain_defs.get(argument.id, [])
+                           if isinstance(d, FUNCTION_NODES) and (scope is None or scope in scopes)]
+                if visible:
+                    self.add_callee(owner, f"{argument.id} (passed along)")
+
+    def note_property_setter(self, target, owner, cls, self_name):
+        """self.x = value runs the class's @x.setter method, when it has one."""
+        is_self_attribute = (cls is not None and self_name and isinstance(target, ast.Attribute)
+                             and isinstance(target.value, ast.Name) and target.value.id == self_name)
+        if not is_self_attribute:
+            return
+        for method in cls.methods.get(target.attr, []):
+            if any(isinstance(d, ast.Attribute) and d.attr == "setter" for d in method.decorator_list):
+                self.add_callee(owner, f"{cls.name}.{target.attr} (setter)")
+                return
+
+    def guess_method_target(self, method, owner):
+        """obj.method(): when only one class defines that method name, that class is probably the target."""
+        owners = self.method_owners.get(method, [])
+        if len(owners) == 1 and method not in COMMON_METHODS and not is_dunder(method):
+            self.add_callee(owner, f"{owners[0]}.{method}?")
+
+    def check_plain_call(self, call, name, owner, scopes):
+        structure = self.structure
+        visible = [d for d, scope in structure.plain_defs.get(name, []) if scope is None or scope in scopes]
+        if visible:
+            self.add_callee(owner, name)
+            self.plain_called.add(name)
+        found = structure.single_definition(name)
+        if not found or found[0] not in visible or found[0].decorator_list:
+            return
+        definition = found[0]
+        if isinstance(definition, ast.ClassDef):
+            signature = constructor_signature(structure.classes[definition])
+        else:
+            signature = build_signature(definition, False)
+        if signature:
+            for problem in call_problems(call, signature, f"{name}()"):
+                self.errors.append(finding_for(call, problem))
+
+    def check_method_call(self, call, method, cls):
+        definitions = cls.methods.get(method, [])
+        replaced = method in cls.set_on_self   # self.method = something would replace the method
+        if len(definitions) == 1 and not definitions[0].decorator_list and not replaced:
+            signature = build_signature(definitions[0], True)
+            if signature:
+                for problem in call_problems(call, signature, f"self.{method}()"):
+                    self.errors.append(finding_for(call, problem))
+        elif not definitions and method not in cls.members and not cls.has_parent \
+                and not cls.decorated and not cls.dynamic:
+            message = f'self.{method}() is called, but class {cls.name} has no method or attribute "{method}"'
+            self.errors.append(finding_for(call, ("unknown-method", message)))
+
+def unused_names(structure, check_names):
+    """Functions and methods that nothing in the code (or in the user's checks) refers to."""
+    used = structure.referenced | check_names
+    unused = []
+    for name, found in structure.plain_defs.items():
+        for definition, _ in found:
+            registered_elsewhere = isinstance(definition, ast.ClassDef) and (definition.bases or definition.keywords)
+            if name not in used and not definition.decorator_list and not is_dunder(name) and not registered_elsewhere:
+                unused.append(name)
+    for info in structure.classes.values():
+        if info.has_parent or info.decorated:
+            continue
+        for name, definitions in info.methods.items():
+            if name in used or is_dunder(name) or name in IMPORT_HOOKS or any(d.decorator_list for d in definitions):
+                continue
+            unused.append(f"{info.name}.{name}")
+    return unused
+
+def build_call_map(structure, walker, check_names):
+    lines = [f"{owner} → {', '.join(callees)}" for owner, callees in walker.callees.items()]
+    every_function = [n for n, found in structure.plain_defs.items()
+                      for d, _ in found if isinstance(d, FUNCTION_NODES)]
+    every_function += [f"{i.name}.{n}" for i in structure.classes.values() for n in i.methods]
+    lines += [f"{name} → (calls no other function here)" for name in every_function if name not in walker.callees]
+
+    unused = unused_names(structure, check_names)
+    if unused:
+        lines += ["", f"Never called or referenced: {', '.join(unused)}"]
+        if structure.uses_dynamic_lookup:
+            lines.append("(This code looks names up by text, for example with getattr, so some of these may be used that way.)")
+    if any(callee.endswith("?") for callees in walker.callees.values() for callee in callees):
+        lines += ["", "? = a best guess: only one class in this code has a method with that name."]
+    return "\n".join(lines)
+
+def check_names_used(check_lines):
+    names = set()
+    for source in check_lines:
+        try:
+            for node in ast.walk(ast.parse(source, mode="eval")):
+                if isinstance(node, ast.Name):
+                    names.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    names.add(node.attr)
+        except SyntaxError:
+            continue
+    return names
+
+def analyze_structure(tree, check_lines):
+    """Returns (errors, call map text, number of functions and classes found)."""
+    structure = Structure(tree)
+    walker = CallWalker(structure)
+    walker.visit(tree, "(top level)", None, None, [])
+    errors = sorted(walker.errors, key=lambda f: (f["line"], f["column"]))
+    call_map = build_call_map(structure, walker, check_names_used(check_lines))
+    definitions = sum(len(found) for found in structure.plain_defs.values())
+    return errors, call_map, definitions
+
+async def analyze(request):
     code, blanked = blank_notebook_lines(request["code"])
     result = {"blanked": blanked, "syntax": None, "errors": [], "notes": [], "skipReason": None,
-              "output": [], "runErrors": [], "checkCount": 0}
+              "output": [], "runErrors": [], "checkCount": 0,
+              "callMap": "", "structureCount": 0, "structureFailed": None}
 
     try:
         tree = ast.parse(code)
@@ -892,26 +1321,31 @@ def analyze(request):
 
     findings = rule_findings(tree, request["extraNames"])
     result["errors"] = [f for f in findings if f["severity"] == "error"]
-    result["notes"] = [f for f in findings if f["severity"] == "note"]
+    result["notes"] = sorted([f for f in findings if f["severity"] == "note"] + mutable_default_notes(tree),
+                             key=lambda f: f["line"] or 0)
+
+    try:
+        problems, result["callMap"], result["structureCount"] = analyze_structure(tree, request["checks"])
+        result["errors"] = sorted(result["errors"] + problems, key=lambda f: f["line"] or 0)
+    except Exception as error:            # a bug in the structure checks must never stop the other checks
+        result["structureFailed"] = f"{type(error).__name__}: {error}"
     if result["errors"]:
         return result                     # broken code is not run; the page explains why
 
     outside = outside_packages(tree)
-    if outside:
-        result["skipReason"] = ("it imports " + ", ".join(outside) + ", which are not part of standard Python. "
-                                "Zapple's Python runs inside your browser and only has the standard library for now.")
-        return result
-
-    namespace, result["output"], crash = run_code(tree)
-    if crash:
-        result["runErrors"] = [crash]
+    namespace, result["output"], error = await run_code(tree)
+    limit = environment_limit(error, outside) if error else None
+    if limit:
+        result["skipReason"], result["output"] = limit, []   # not the code's fault: report "not test-run"
+    elif error:
+        result["runErrors"] = [crash_finding(error)]
     else:
         result["runErrors"], result["checkCount"] = run_checks(request["checks"], namespace)
     return result
 
-def zapple_analyze(request_json):
+async def zapple_analyze(request_json):
     started = time.perf_counter()
-    result = analyze(json.loads(request_json))
+    result = await analyze(json.loads(request_json))
     result["elapsedMs"] = round((time.perf_counter() - started) * 1000)
     return json.dumps(result)
 `;
@@ -928,6 +1362,14 @@ def zapple_analyze(request_json):
             await pyodide.loadPackage("micropip");
             await pyodide.pyimport("micropip").install("pyflakes");
             pyodide.runPython(data.pythonSource);
+
+            // Loading is finished, so network and storage can be shut off before any user code runs.
+            // (Python code reaches these through the browser bridge, for example "from js import fetch".)
+            for (const name of data.blockedNames) {
+              Object.defineProperty(self, name, {
+                get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
+              });
+            }
             self.postMessage({ type: "ready" });
           } catch (error) {
             self.postMessage({ type: "failed", message: String(error) });
@@ -935,7 +1377,8 @@ def zapple_analyze(request_json):
         } else if (data.type === "run") {
           try {
             const analyze = pyodide.globals.get("zapple_analyze");
-            self.postMessage({ type: "result", result: JSON.parse(analyze(JSON.stringify(data.request))) });
+            const answer = await analyze(JSON.stringify(data.request));
+            self.postMessage({ type: "result", result: JSON.parse(answer) });
           } catch (error) {
             self.postMessage({ type: "result", result: { internalError: String(error) } });
           }
@@ -959,7 +1402,7 @@ def zapple_analyze(request_json):
         worker.onerror = (event) => { clearTimeout(timer); reject(new Error(`Python could not start: ${event.message || "unknown error"}`)); };
       });
 
-      worker.postMessage({ type: "init", pyodideUrl: PYODIDE_URL, pythonSource: PYTHON_SOURCE });
+      worker.postMessage({ type: "init", pyodideUrl: PYODIDE_URL, pythonSource: PYTHON_SOURCE, blockedNames: BLOCKED_BROWSER_APIS });
       return ready.finally(() => URL.revokeObjectURL(url));
     }
 
@@ -993,6 +1436,15 @@ def zapple_analyze(request_json):
           clearTimeout(timer);
           resolve(data.result);
         };
+        // If the worker itself dies (for example it runs out of memory), say so right away
+        // instead of waiting for the timer and calling it an infinite loop.
+        worker.onerror = (event) => {
+          event.preventDefault();
+          clearTimeout(timer);
+          worker.terminate();
+          pythonWorker = null;
+          resolve({ workerFailed: event.message || "unknown error" });
+        };
         worker.postMessage({ type: "run", request });
       });
     }
@@ -1014,6 +1466,7 @@ def zapple_analyze(request_json):
       "Rules:",
       "- Fix every problem listed and change nothing else. Do not rewrite, rename, reformat, or add features.",
       "- For a name that is not defined, either define it or use the correct name that already exists in the code. Do not delete the code that uses it.",
+      "- For a call with the wrong arguments, fix the call or the function definition, whichever matches what the code is meant to do. Keep every other call working.",
       "- Problems marked [runtime] crashed when the code was run. Fix the cause of the crash.",
       "- Problems marked [check] are tests written by the user. The corrected code must pass them.",
       REPLY_RULE,
@@ -1282,6 +1735,10 @@ def zapple_analyze(request_json):
       }, log);
 
       if (analysis.internalError) throw new Error(analysis.internalError);
+      if (analysis.workerFailed) {
+        log.add(`Python stopped unexpectedly: ${analysis.workerFailed}`);
+        throw new Error(`Python stopped unexpectedly (${analysis.workerFailed}). It restarts on the next check, which takes a few extra seconds.`);
+      }
 
       if (analysis.timedOut) {
         const seconds = RUN_TIMEOUT_MS / 1000;
@@ -1300,7 +1757,12 @@ def zapple_analyze(request_json):
         return;
       }
       log.add("Syntax check: passed");
-      log.add(`Rule check (pyflakes): ${countLabel(analysis.errors.length, "error")}, ${countLabel(analysis.notes.length, "note")}`);
+      log.add(`Rule check and structure check (pyflakes + Zapple): ${countLabel(analysis.errors.length, "error")}, ${countLabel(analysis.notes.length, "note")}`);
+      if (analysis.structureFailed) {
+        log.add(`Structure check could not finish (${analysis.structureFailed}). The other checks still ran`);
+      } else {
+        log.add(`Structure check: ${countLabel(analysis.structureCount, "definition")} found`);
+      }
 
       let run;
       if (analysis.errors.length > 0) {
@@ -1321,8 +1783,28 @@ def zapple_analyze(request_json):
 
       const errors = [...analysis.errors, ...run.errors];
       const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
-      showReport({ errors, notes: analysis.notes, callMap: "", run, promptText });
+      showReport({ errors, notes: analysis.notes, callMap: analysis.callMap, run, promptText });
     }
+
+    /**
+     * The structure check with its own safety net: if it hits a bug, the other results still show
+     * (the Python side has the same protection). Returns { problems, callMap }.
+     */
+    function checkStructureSafely(request) {
+      try {
+        const structure = analyzeStructure(request.code, request.sourceType);
+        const problems = findStructureProblems(structure);
+        log.add(`Structure check: ${countLabel(structure.functions.size, "function")} found, `
+          + `${countLabel(problems.errors.length, "error")}, ${countLabel(problems.notes.length, "note")}`);
+        return { problems, callMap: buildCallMap(structure) };
+      } catch (error) {
+        log.add(`Structure check could not finish (${error.message}). The other checks still ran`);
+        return { problems: { errors: [], notes: [] }, callMap: "" };
+      }
+    }
+
+    // A very large paste can freeze the page, because the checks run inside it.
+    const MAX_CODE_CHARS = 200000;   // roughly 5,000 lines
 
     async function handleCheck() {
       if (typeof acorn === "undefined") {
@@ -1331,6 +1813,15 @@ def zapple_analyze(request_json):
       }
       if (codeInput.value.trim() === "") {
         showMessage("error", "Nothing to check", "Paste some code first.");
+        return;
+      }
+      if (codeInput.value.length > MAX_CODE_CHARS) {
+        log.reset();
+        log.add(`Check refused: ${codeInput.value.length.toLocaleString()} characters is over the limit of ${MAX_CODE_CHARS.toLocaleString()}`);
+        showMessage("error", "Code is too large to check",
+          "Zapple checks code inside this web page, and a very large paste can freeze the page.\n\n"
+          + `The limit is ${MAX_CODE_CHARS.toLocaleString()} characters (roughly 5,000 lines). Your code has ${codeInput.value.length.toLocaleString()}.\n\n`
+          + "Tip: check one part at a time, for example one class or a few related functions.");
         return;
       }
 
@@ -1368,13 +1859,10 @@ def zapple_analyze(request_json):
       const lint = lintCode(request);
       log.add(`Rule check: ${countLabel(lint.errors.length, "error")}, ${countLabel(lint.notes.length, "note")}`);
 
-      const structure = analyzeStructure(request.code, request.sourceType);
-      const problems = findStructureProblems(structure);
-      log.add(`Structure check: ${countLabel(structure.functions.size, "function")} found, `
-        + `${countLabel(problems.errors.length, "error")}, ${countLabel(problems.notes.length, "note")}`);
+      const structure = checkStructureSafely(request);
 
-      const staticErrors = [...lint.errors, ...problems.errors];
-      const notes = [...lint.notes, ...problems.notes];
+      const staticErrors = [...lint.errors, ...structure.problems.errors];
+      const notes = [...lint.notes, ...structure.problems.notes];
 
       // Only test-run code that passed the static checks, so the same problem is not reported twice
       const run = staticErrors.length === 0
@@ -1384,7 +1872,7 @@ def zapple_analyze(request_json):
 
       const errors = [...staticErrors, ...run.errors];
       const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
-      showReport({ errors, notes, callMap: buildCallMap(structure), run, promptText });
+      showReport({ errors, notes, callMap: structure.callMap, run, promptText });
     }
 
     function handleClear() {
