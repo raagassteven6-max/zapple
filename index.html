@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Zapple</title>
 
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=VT323&family=Courier+Prime&display=swap" rel="stylesheet">
   <script src="browser-globals.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -52,10 +55,22 @@
     </details>
   </main>
 
+  <!-- The bot mascot. bot.js finds it by the ids bots, bubble and orb. -->
+  <div class="bots-wrap">
+    <div class="buddy" id="bots" data-state="idle">
+      <div class="bubble" id="bubble"></div>
+      <div class="buddy-orb" id="orb">
+        <div class="orb"></div>
+        <div class="eyes"><span class="eye"></span><span class="eye"></span></div>
+      </div>
+    </div>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/acorn@8.11.3/dist/acorn.js"></script>
   <!-- ESLint's rule engine, bundled for browsers. Exposes the global `eslint`. -->
   <script src="https://cdn.jsdelivr.net/npm/eslint-linter-browserify@9.37.0/linter.js"></script>
   <script src="checks.js"></script>
+  <script src="bot.js"></script>
   <script src="ui.js"></script>
 </body>
 </html>
