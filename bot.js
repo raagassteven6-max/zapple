@@ -102,7 +102,17 @@
     });
   });
 
-  orb.addEventListener("click", () => { orb.classList.remove("hop"); void orb.offsetWidth; orb.classList.add("hop"); blink(); say(pick(LINES.poke)); });
+  // Back to idle (eyes wander again). Used by the Clear button and by tapping the bot.
+  function wakeUp() { if (state !== "idle") window.setBotState("idle"); }
+
+  orb.addEventListener("click", () => {
+    wakeUp();  // tapping the bot after a check returns it to idle
+    orb.classList.remove("hop"); void orb.offsetWidth; orb.classList.add("hop"); blink(); say(pick(LINES.poke));
+  });
+
+  // Clear button: go idle and put the old speech bubble away
+  const clearBtn = document.getElementById("clear-button");
+  if (clearBtn) clearBtn.addEventListener("click", () => { wakeUp(); bubble.classList.remove("show"); });
   orb.addEventListener("animationend", e => { if (e.animationName === "hop") orb.classList.remove("hop"); });
   setInterval(() => { if (state === "idle" && !document.hidden && Date.now() - lastSpoke > 45000 && Math.random() < .5) say(pick(LINES.quip)); }, 20000);
 
