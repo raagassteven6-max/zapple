@@ -1,4 +1,4 @@
- # Zapple
+# Zapple
 
 Zapple checks AI-written JavaScript **before** you use it, entirely in your browser.
 
@@ -70,11 +70,13 @@ All stages produce the same **finding** shape (`line`, `column`, `message`, `rul
 Code is test-run in a Web Worker: a separate background thread with no access to the page.
 
 - **Time limit:** 3 seconds to reach the last line. After that the worker is stopped and reported as a possible infinite loop. After the last line, Zapple waits half a second for delayed errors from timers and promises.
-- **Blocked:** `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `importScripts`, `indexedDB`, and `caches`. Using one is reported as a crash.
+- **Blocked, in both JavaScript and Python:** `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `importScripts`, `indexedDB`, and `caches`. Using one is reported as a crash. Python needs the network while it loads, so these are switched off once loading is finished, before any of your code runs. That also stops code that reaches them through the browser bridge (for example `from js import fetch`).
 - **Captured:** `console.log`, `info`, `warn`, `error` and `debug`, shown on screen and in the log.
 - **Line numbers:** crash locations are mapped back to your code from the error's stack trace. Browsers format traces differently, so some crashes are reported without a line.
 
-This protects against accidents such as runaway loops and stray network calls. It is not designed to contain hostile code.
+This protects against accidents such as runaway loops and stray network calls. It is not designed to contain hostile code. One more limit worth knowing: every project hosted under the same GitHub Pages address (for example `yourname.github.io`) counts as one website to the browser and shares the same stored data. The block above keeps test code away from that data, but the safest setup is to host Zapple at its own address.
+
+**Size limit:** pasted code over 200,000 characters (roughly 5,000 lines) is refused with an explanation, because the checks run inside the page and a very large paste can freeze it. Check one part at a time instead.
 
 ### What is not test-run yet
 
@@ -96,14 +98,15 @@ Python runs through [Pyodide](https://pyodide.org), Python compiled to work insi
 - **Notebook lines** such as `!pip install x` or `%matplotlib inline` are not Python. Zapple replaces each with `pass`, so line numbers stay correct, and notes it in the log.
 - **Names from earlier notebook cells** can be listed in the "Extra names" box so they are not reported as undefined.
 - **Standard library only:** code that imports packages such as torch, transformers or numpy still gets the syntax and rule checks, but the test run is skipped, and Zapple explains why.
-- Structure checks (argument counts, call map) are not available for Python yet.
+- **Structure checks** work for Python too: wrong argument counts (positional, keyword, missing), unknown `self.method()` calls, constructor calls checked against `__init__`, mutable default values, and a call map. Links in the call map that Zapple can only guess (an object's method found in exactly one class) end in `?`.
+- **Browser limits:** `asyncio.run(...)` at the top level is run as `await ...`, because the browser's Python already has an event loop. Code that starts threads cannot run in a browser, so it is reported as "not test-run" instead of as a crash.
 
 ## Dependencies
 
 Loaded from a CDN when needed (a connection is required the first time):
 
 - acorn 8.11.3
-- eslint-linter-browserify 9.x (exposes the global `eslint`)
+- eslint-linter-browserify 9.37.0 (exposes the global `eslint`)
 - Pyodide 0.26.4, and pyflakes (installed inside Pyodide), only when Python is chosen
 
 ## Run or deploy
@@ -118,6 +121,6 @@ Serve the folder from any static host. On GitHub Pages: repository Settings, Pag
 - [x] Sandbox test run and log
 - [x] Structure checks, text call map, and user-written checks
 - [x] Python syntax, rule checks and test run (standard library only)
-- [ ] Python structure checks (argument counts, call map)
+- [x] Python structure checks (argument counts, call map)
 - [ ] Optional remote runner for heavy libraries such as torch and transformers
 - [ ] Optional small ONNX models (routing, error classification)
