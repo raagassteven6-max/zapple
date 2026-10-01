@@ -1,176 +1,284 @@
+/* ==========================================================================
+   Zapple: retro terminal theme
+   Colors and fonts come from your zapple-revised.html design.
+   Layout of this file:  1 colors  2 page  3 form  4 results  5 log  6 bot
+   ========================================================================== */
+
+/* ---- 1. Colors and fonts (change a color here and it changes everywhere) ---- */
 :root {
-  --bg: #f4f5f7;
-  --panel: #ffffff;
-  --text: #1c2128;
-  --muted: #5c6673;
-  --border: #cfd5dd;
-  --accent: #1f4fc4;
-  --ok: #11693f;
-  --ok-bg: #e2f4ea;
-  --error: #a8231b;
-  --error-bg: #fcebe9;
+  --bg: #0a0612;           /* purple-black screen */
+  --panel: #100a1c;
+  --line: #2b1d45;         /* thin borders */
+  --green: #4dff91;        /* main text and "all good" */
+  --green-dim: #86b99a;    /* quieter text */
+  --pink: #ff3d7f;         /* the brand, and errors only */
+  --amber: #ffb000;        /* warnings and notes only */
+  --ok-bg: #0d2418;
+  --error-bg: #2a1220;
+  --warn-bg: #2a2108;
+  --mono: "Courier Prime", "Courier New", monospace;     /* body text */
+  --crt: "VT323", "Courier New", monospace;              /* headings and buttons */
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #14181d;
-    --panel: #1d232a;
-    --text: #e6eaef;
-    --muted: #97a1ad;
-    --border: #35404b;
-    --accent: #7ba3ff;
-    --ok: #6fd6a0;
-    --ok-bg: #163527;
-    --error: #ff9b93;
-    --error-bg: #3a1c1a;
-  }
-}
-
+/* ---- 2. The page ---- */
 * { box-sizing: border-box; }
+html { background: var(--bg); }
 
 body {
   margin: 0;
-  padding: 16px;
-  background: var(--bg);
-  color: var(--text);
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 24px 16px 40px;
+  background: radial-gradient(ellipse at 50% 0%, #170d2b 0%, var(--bg) 70%);
+  color: var(--green);
+  font: 16px/1.5 var(--mono);
 }
 
-main {
-  max-width: 720px;
-  margin: 0 auto;
+/* Faint scanlines. Texture only: no flicker, and it never blocks taps or text selection. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, transparent 0 2px, rgba(0, 0, 0, .18) 2px 3px);
 }
 
-h1 { margin: 0 0 4px; font-size: 1.4rem; }
-.subtitle { margin: 0 0 16px; color: var(--muted); }
+.wrap { max-width: 1080px; margin: 0 auto; }
 
-label { display: block; margin-bottom: 6px; font-weight: 600; }
-
-textarea {
-  width: 100%;
-  min-height: 260px;
-  padding: 12px;
-  resize: vertical;
-  background: var(--panel);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font: 14px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  tab-size: 2;
-}
-
-.controls {
+header {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  margin: 12px 0 16px;
+  gap: 24px;
+  align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 28px;
 }
 
-select, button {
+h1 {
+  margin: 0;
+  font: 400 clamp(56px, 11vw, 96px)/.9 var(--crt);
+  color: var(--pink);
+  letter-spacing: .02em;
+  text-shadow: 0 0 6px rgba(255, 61, 127, .75), 0 0 22px rgba(255, 61, 127, .35);   /* the one glow on the page */
+}
+
+.subtitle { margin: 8px 0 0; max-width: 52ch; color: var(--green-dim); }
+
+/* One column on phones; form and results on the left, log on the right on wide screens */
+.layout { display: grid; gap: 20px; }
+@media (min-width: 880px) {
+  .layout { grid-template-columns: 1fr 340px; align-items: start; }
+  .log { position: sticky; top: 16px; }
+}
+
+.panel, .log { padding: 18px; background: var(--panel); border: 1px solid var(--line); }
+
+/* ---- 3. The form ---- */
+.field { margin-bottom: 18px; }
+.field:last-of-type { margin-bottom: 0; }
+
+label {
+  display: block;
+  margin-bottom: 4px;
+  font: 400 22px/1 var(--crt);
+}
+
+.hint { margin: 0 0 8px; color: var(--green-dim); font-size: 14px; }
+
+textarea, input[type="text"], select {
+  width: 100%;
   min-height: 44px;
-  padding: 0 16px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--panel);
-  color: var(--text);
-  font: inherit;
+  padding: 10px 12px;
+  background: #07040e;
+  color: var(--green);
+  border: 1px solid var(--line);
+  border-radius: 0;
+  font: 15px/1.5 var(--mono);
+  caret-color: var(--pink);
 }
 
-button { cursor: pointer; }
+textarea { resize: vertical; tab-size: 4; }
+#code-input { min-height: 220px; }
+.checks-box { min-height: 88px; }
+::placeholder { color: #5f7f6c; }
 
-button.primary {
-  flex: 1;
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--bg);
-  font-weight: 600;
-}
-
-textarea:focus-visible,
-select:focus-visible,
-button:focus-visible {
-  outline: 3px solid var(--accent);
+textarea:focus, input:focus, select:focus, button:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--green);
   outline-offset: 2px;
+  border-color: var(--green);
 }
+
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin-top: 18px; }
+.controls select { width: auto; }
+
+button {
+  min-height: 44px;
+  padding: 10px 18px;
+  border: 1px solid var(--green);
+  border-radius: 0;
+  background: transparent;
+  color: var(--green);
+  font: 400 22px/1 var(--crt);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: var(--green-dim); color: #04110a; }
+button:disabled { opacity: .5; cursor: wait; }
+
+button.primary { margin-left: auto; background: var(--green); color: #04110a; }
+button.primary:hover:not(:disabled) { background: #fff; }
+
+/* ---- 4. Results ---- */
+#result { margin-top: 20px; }
 
 .result {
   padding: 14px;
-  border-radius: 6px;
-  border: 1px solid transparent;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left-width: 4px;     /* the colored bar on the left says what kind of result it is */
 }
 
-.result.ok    { background: var(--ok-bg);    color: var(--ok);    border-color: var(--ok); }
-.result.error { background: var(--error-bg); color: var(--error); border-color: var(--error); }
+.result + .result { margin-top: 12px; }
 
-.result-title { margin: 0 0 4px; font-weight: 700; }
-.result-detail { margin: 0 0 8px; color: var(--text); white-space: pre-line; }
+.result.ok    { background: var(--ok-bg);    border-color: var(--green); }
+.result.error { background: var(--error-bg); border-color: var(--pink); }
+.result.error .result-title { color: var(--pink); }
+.result.ok .result-title    { color: var(--green); }
+
+/* Lists of notes get the amber warning color; the call map and console output stay calm */
+.result.note { border-color: var(--green-dim); }
+.result.note:has(.finding-list) { background: var(--warn-bg); border-color: var(--amber); }
+.result.note:has(.finding-list) .result-title { color: var(--amber); }
+
+/* The plain-language summary Zapple writes above the technical results */
+.result.insight { border-left-color: var(--green); }
+.result.insight .result-title::before { content: "> "; color: var(--pink); }
+
+.result-title { margin: 0 0 6px; font: 400 24px/1 var(--crt); }
+.result-detail { margin: 0 0 8px; color: var(--green); white-space: pre-line; }
 
 .code-frame {
   margin: 0 0 12px;
   padding: 10px;
   overflow-x: auto;
-  background: var(--panel);
-  color: var(--text);
-  border-radius: 4px;
-  font: 13px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  background: #07040e;
+  color: var(--green);
+  border: 1px solid var(--line);
+  font: 13px/1.5 var(--mono);
 }
 
-.field { margin-top: 12px; }
-
-input[type="text"] {
-  width: 100%;
-  min-height: 44px;
-  padding: 0 12px;
-  background: var(--panel);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font: inherit;
-}
-
-input[type="text"]:focus-visible {
-  outline: 3px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.prompt-section { margin-top: 16px; }
-.prompt-box { min-height: 180px; font-size: 13px; }
-.prompt-section button.primary { width: 100%; margin-top: 8px; }
-
-.result + .result { margin-top: 12px; }
-.result.note { background: var(--panel); color: var(--text); border-color: var(--border); }
-
-.finding-list {
-  display: grid;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
+.finding-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 
 .finding {
   width: 100%;
   min-height: 44px;
   padding: 8px 12px;
+  border-color: var(--line);
+  color: var(--green);
+  font: 14px/1.4 var(--mono);
   text-align: left;
 }
 
-.checks-box { min-height: 88px; }
+.result.error .finding:hover:not(:disabled) { background: var(--pink); color: #12050b; }
+.result.note .finding:hover:not(:disabled) { background: var(--amber); color: #1a1100; }
 
-.log { margin-top: 16px; }
+.prompt-section { margin-top: 16px; }
+.prompt-box { min-height: 180px; font-size: 13px; }
+.prompt-section button.primary { width: 100%; margin: 8px 0 0; }
 
+/* ---- 5. Log ---- */
 .log summary {
   display: flex;
   align-items: center;
   min-height: 44px;
-  font-weight: 600;
+  font: 400 22px/1 var(--crt);
   cursor: pointer;
 }
 
-.log-output {
-  max-height: 280px;
+.log-body, .log-output {
+  max-height: 340px;
   margin: 0;
   overflow: auto;
+  color: var(--green-dim);
+  font-size: 13px;
   white-space: pre-wrap;
 }
+
+.log .code-frame { border: 0; padding: 0; background: transparent; }
+
+/* ==========================================================================
+   6. The bot (carried over from your design; behavior lives in bot.js)
+   ========================================================================== */
+  /* ---- Buddy: one glossy orb with pill eyes. State lives in data-state on #bots ---- */
+  .bots-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+  .buddy {
+    --c: #2fe27a; --ring: #14261b; --glow: rgba(77,255,145,.3); --tx: var(--green);
+    --gx: 0; --gy: 0;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .buddy[data-state="fail"]    { --c: #ff3d7f; --ring: #2a1220; --glow: rgba(255,61,127,.35); --tx: var(--pink); }
+  .buddy[data-state="cantrun"] { --c: #ffb000; --ring: #2a2108; --glow: rgba(255,176,0,.3);   --tx: var(--amber); }
+
+  .bubble {
+    width: 208px; min-height: 46px; padding: 8px 12px; position: relative;
+    background: var(--panel); border: 1px solid var(--tx); border-radius: 12px;
+    color: var(--tx); font: 400 20px/1.1 var(--crt);
+    opacity: 0; transform: translateX(8px) scale(.96); pointer-events: none;
+    transition: opacity .25s, transform .35s cubic-bezier(.3,1.4,.5,1), color .4s, border-color .4s;
+  }
+  .bubble.show { opacity: 1; transform: none; }
+  .bubble::after {  /* tail pointing at the orb */
+    content: ""; position: absolute; right: -6px; top: 50%; width: 10px; height: 10px; margin-top: -5px;
+    background: var(--panel); border: 1px solid var(--tx); border-left: 0; border-bottom: 0; transform: rotate(45deg);
+    transition: border-color .4s;
+  }
+
+  .buddy-orb { position: relative; width: 56px; height: 56px; flex: none; cursor: pointer; }
+  .orb {
+    position: absolute; inset: 0; border-radius: 50%; background: var(--c); overflow: hidden;
+    box-shadow: 0 0 0 4px var(--ring), 0 0 22px var(--glow);
+    transform: translate(calc(var(--gx) * .35px), calc(var(--gy) * .35px));  /* body leans toward the gaze */
+    transition: transform .55s cubic-bezier(.25,.8,.25,1), background-color .5s, box-shadow .5s;
+  }
+  .orb::before {  /* glassy highlights and edge shading */
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+    background:
+      radial-gradient(circle at 32% 20%, rgba(255,255,255,.6) 0, rgba(255,255,255,0) 42%),
+      radial-gradient(circle at 50% 118%, rgba(255,255,255,.4) 0, rgba(255,255,255,0) 55%),
+      radial-gradient(circle at 50% 50%, transparent 55%, rgba(0,20,10,.38) 100%);
+  }
+  .eyes {
+    position: absolute; left: 50%; top: 44%; display: flex; gap: 10px;
+    transform: translate(-50%, -50%) translate(calc(var(--gx) * 1px), calc(var(--gy) * 1px));
+    transition: transform .5s cubic-bezier(.25,.8,.25,1), gap .35s;
+  }
+  .eye {
+    width: 6px; height: 14px; border-radius: 6px; background: #f3fff7; box-sizing: border-box;
+    transform: rotate(var(--tilt, 8deg)) scaleY(var(--b, 1));
+    transition: transform .1s ease-out, width .35s, height .35s, border-radius .35s, background-color .3s, border-color .3s;
+  }
+  .eye:nth-child(1) { --tilt: -8deg; }
+  .buddy.blink { --b: .12; }
+
+  /* expressions */
+  .buddy[data-state="pass"] .eyes { gap: 8px; }
+  .buddy[data-state="pass"] .eye { --tilt: 0deg; width: 14px; height: 7px; background: transparent; border-top: 4px solid #f3fff7; border-radius: 14px 14px 0 0; }
+  .buddy[data-state="fail"] .eye { height: 20px; }
+  .buddy[data-state="fail"] .eye:nth-child(1) { --tilt: 14deg; }
+  .buddy[data-state="fail"] .eye:nth-child(2) { --tilt: -14deg; }
+  .buddy[data-state="cantrun"] .eyes { gap: 7px; }
+  .buddy[data-state="cantrun"] .eye { --tilt: 0deg; width: 15px; height: 5px; border-radius: 5px; }
+
+  /* body motion */
+  @keyframes bob   { 0%,100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-3px) scale(1.025); } }
+  @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+  @keyframes hop   { 0% { transform: translateY(0) scale(1); } 20% { transform: translateY(2px) scale(1.08,.9); }
+                     55% { transform: translateY(-12px) scale(.94,1.08); } 80% { transform: translateY(0) scale(1.06,.94); } 100% { transform: none; } }
+  @keyframes shake { 0%,100% { transform: none; } 20% { transform: translateX(-4px); } 40% { transform: translateX(4px); } 60% { transform: translateX(-3px); } 80% { transform: translateX(3px); } }
+  .buddy[data-state="idle"] .buddy-orb,
+  .buddy[data-state="cantrun"] .buddy-orb { animation: bob 4s ease-in-out infinite; }
+  .buddy[data-state="checking"] .buddy-orb { animation: pulse .9s ease-in-out infinite; }
+  .buddy[data-state="pass"] .buddy-orb { animation: hop .7s ease 1; }
+  .buddy[data-state="fail"] .buddy-orb { animation: shake .5s ease 1; }
+  .buddy .buddy-orb.hop { animation: hop .7s ease 1; }
+
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }

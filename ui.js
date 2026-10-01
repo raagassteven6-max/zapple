@@ -31,6 +31,7 @@ function buildMessageBox(kind, title, detail) {
 
 function showMessage(kind, title, detail) {
   showResult(buildMessageBox(kind, title, detail));
+  if (kind === "error") updateBot("fail", `${title}.`);
 }
 
 /** Shows the bad line with a caret under the problem column. */
@@ -55,6 +56,7 @@ function showSyntaxError(problem, promptText) {
     jumpButton
   );
   showResult(box, buildPromptSection(promptText));
+  updateBot("fail", "Syntax error. Details below.");
 }
 
 /** The repair prompt in a read-only box, with a button that copies it. */
@@ -86,6 +88,11 @@ async function copyPrompt(promptBox, button) {
     promptBox.select();
     flashLabel(button, "Selected. Copy it manually");
   }
+}
+
+/** Tells the little bot how the check went. The page works the same without bot.js. */
+function updateBot(state, message) {
+  if (window.setBotState) window.setBotState(state, message);
 }
 
 /** Shows a message on a button for two seconds, then restores its label. */
@@ -174,7 +181,7 @@ function buildInsightBox({ errors, notes, run, untraced }) {
     lines.push(`${countLabel(notes.length, "note")}: worth a look, but not necessarily mistakes.`);
   }
 
-  const box = el("div", "result note");
+  const box = el("div", "result note insight");
   box.append(el("p", "result-title", "Insight"), el("p", "result-detail", lines.join("\n")));
   return box;
 }
@@ -201,6 +208,10 @@ function showReport({ errors, notes, callMap, run, promptText, untraced = { coun
     blocks.push(buildPromptSection(promptText));
   }
   showResult(...blocks);
+
+  if (errors.length > 0) updateBot("fail", `${countLabel(errors.length, "problem")} found. Details below.`);
+  else if (run.status === "skipped") updateBot("cantrun", "Couldn't test-run this. The reason is below.");
+  else updateBot("pass");
 }
 
 /** Highlights a line inside the textarea so it can be fixed right away. */
@@ -375,6 +386,7 @@ function handleClear() {
 
 checkButton.addEventListener("click", async () => {
   checkButton.disabled = true;   // no second run while the sandbox is busy
+  updateBot("checking");
   try {
     await handleCheck();
   } catch (error) {
