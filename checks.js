@@ -248,14 +248,23 @@
 
     /** The reason this code cannot be test-run yet, or null if it can. */
     function findSkipReason(code, sourceType) {
-      for (const token of acorn.tokenizer(code, { ecmaVersion: "latest", sourceType })) {
+      const tokens = [...acorn.tokenizer(code, { ecmaVersion: "latest", sourceType })];
+      for (let index = 0; index < tokens.length; index++) {
+        const token = tokens[index];
+        const previous = tokens[index - 1];
+        const next = tokens[index + 1];
         if (token.type === acorn.tokTypes._import) {
           return {
             reason: "it uses import, which loads other files or libraries. Zapple's test area cannot load them yet, so it cannot run this code.",
             tip: "If the import is only for a helper you can copy, paste that helper into the box instead.",
           };
         }
-        if (token.type === acorn.tokTypes.name && PAGE_ONLY_NAMES.has(token.value)) {
+        // A page-only name only counts as real use when it is not a property access
+        // (obj.window, obj?.document) and not an object key or label ({ document: 1 }).
+        const afterDot = Boolean(previous)
+          && (previous.type === acorn.tokTypes.dot || previous.type === acorn.tokTypes.questionDot);
+        const isKeyOrLabel = Boolean(next) && next.type === acorn.tokTypes.colon;
+        if (token.type === acorn.tokTypes.name && PAGE_ONLY_NAMES.has(token.value) && !afterDot && !isKeyOrLabel) {
           return {
             reason: `it uses "${token.value}", which only exists inside a web page. Zapple tests code in a separate background area that has no web page, so this line would crash there even if it is correct on your site.`,
             tip: "Test the logic separately: paste only the functions that calculate or handle data, and use Checks on them. The lines that touch the page are still covered by the syntax, rule and structure checks.",
@@ -338,6 +347,10 @@
             checkResults.push(data);
             log.add(`Check ${data.passed ? "passed" : "failed"}: ${parsedChecks.checks[data.index].source}`);
           } else if (data.type === "finished") {
+            // The code reached its last line, so the "did not finish" timer is no longer
+            // relevant; only the settle window for delayed errors remains. Without this,
+            // code finishing between ~2.5 s and 3 s is wrongly reported as a timeout.
+            clearTimeout(timeoutTimer);
             log.add("Code reached its last line; waiting for delayed errors");
             settleTimer = setTimeout(() => {
               errors.push(...failedCheckFindings(checkResults, parsedChecks.checks));
@@ -397,6 +410,7 @@
       const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
       const structure = {
         functions: new Map(),        // name or "service.greet" -> { min, max } arguments accepted
+        functionCount: new Map(),    // how many times each name was defined; a name defined twice is ambiguous
         calls: [],                   // direct calls to plain names
         methodCalls: [],             // this.method() calls
         memberCalls: [],             // obj.method() calls where obj is a plain name
@@ -443,13 +457,21 @@
       }
 
       function defineFunction(node) {
+        let name = null;
         if (node.type === "FunctionDeclaration" && node.id) {
-          structure.functions.set(node.id.name, argumentRange(node));
+          name = node.id.name;
         } else if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && isFunction(node.init)) {
-          structure.functions.set(node.id.name, argumentRange(node.init));
+          name = node.id.name;
         } else if (objectMethodName(node)) {
-          structure.functions.set(objectMethodName(node), argumentRange(node.value));
+          name = objectMethodName(node);
         }
+        if (!name) return;
+        // Count definitions: a name defined more than once (two scopes, declaration + assignment)
+        // is ambiguous, and argument checks must not trust the last definition seen. This is the
+        // same guard the Python structure checks apply via single_definition().
+        structure.functionCount.set(name, (structure.functionCount.get(name) ?? 0) + 1);
+        const fn = node.init ?? node.value ?? node;
+        structure.functions.set(name, argumentRange(fn));
       }
 
       /** Remembers the members of object literals, including shorthand { greet } -> outer function greet. */
@@ -587,6 +609,11 @@
       return structure;
     }
 
+    /** "1 argument" / "2 arguments" — shared wording for the argument-count findings. */
+    function countLabel(count, noun) {
+      return `${count} ${noun}${count === 1 ? "" : "s"}`;
+    }
+
     function structureFinding(call, message, ruleId, severity) {
       return { line: call.line, column: call.column, message, ruleId, severity };
     }
@@ -603,7 +630,7 @@
      * Too many arguments and unknown this.methods / obj.methods are errors; too few arguments is only a note,
      * because leaving an argument out is sometimes intentional. Best-guess links never produce argument errors.
      */
-    function findStructureProblems({ functions, calls, memberCalls, methodCalls, aliases, shorthandTargets, nameCounts }) {
+    function findStructureProblems({ functions, functionCount, calls, memberCalls, methodCalls, aliases, shorthandTargets, nameCounts }) {
       const errors = [];
       const notes = [];
       const usesArguments = nameCounts.has("arguments");   // such code can accept any number of arguments
@@ -611,7 +638,10 @@
       for (const call of calls) {
         const aliased = resolveAliasTarget(aliases, call.name);
         const known = functions.get(call.name) ?? (aliased ? functions.get(aliased) : undefined);
-        if (!known || call.hasSpread || usesArguments) continue;
+        // A name defined more than once may not be the function this call reaches.
+        const ambiguous = (functionCount.get(call.name) ?? 1) > 1
+          || (aliased && (functionCount.get(aliased) ?? 1) > 1);
+        if (!known || ambiguous || call.hasSpread || usesArguments) continue;
         const given = countLabel(call.argCount, "argument");
         const label = aliased ? `${call.name}() (alias for ${aliased}())` : `${call.name}()`;
 
@@ -633,7 +663,7 @@
             label = `${key}() (shorthand for ${shorthand}())`;
           }
         }
-        if (!known || call.hasSpread || usesArguments) continue;
+        if (!known || (functionCount.get(key) ?? 1) > 1 || call.hasSpread || usesArguments) continue;
         const given = countLabel(call.argCount, "argument");
 
         if (call.argCount > known.max) {
@@ -776,11 +806,12 @@
 
       if (unused.length > 0) lines.push("", `Never called or referenced: ${unused.join(", ")}`);
       if (stats.guessed > 0) {
-        lines.push("", "A name ending in ? is a best guess: only one place in this code has that name, so Zapple links it, but it cannot prove it.");
+        lines.push("", "A name ending in ? is a suggested link: only one place in this code has that name, so Zapple shows that link, but reading the code cannot prove the call goes there.");
       }
       if (stats.notFollowed > 0) {
-        lines.push("", "Some calls could not be traced by reading the code. They are listed under the calling function with a '?'. "
-          + "Only direct calls, this.method(), known object methods and one-step aliases (const fn = greet) are followed.");
+        lines.push("", "Some calls could not be traced by reading the code. A ? at the start of a line marks such a call. "
+          + "Zapple follows only direct calls, this.method(), known object methods and one-step aliases (const fn = greet). "
+          + "Every other call is listed under the calling function as not traced.");
       }
 
       return { text: lines.join("\n"), stats };
@@ -1301,15 +1332,29 @@ def unused_names(structure, check_names):
     return unused
 
 def build_call_map(structure, walker, check_names):
-    lines = [f"{owner} → {', '.join(callees)}" for owner, callees in walker.callees.items()]
+    untraced = {}
+    for owner, items in walker.not_followed.items():
+        untraced[owner] = [f"    ? {text}  not followed, {why} (line {line})" for text, why, line in items]
+
+    printed = set()
+    lines = []
+    for owner, callees in walker.callees.items():
+        printed.add(owner)
+        lines.append(f"{owner} → {', '.join(callees)}")
+        lines.extend(untraced.get(owner, []))
     every_function = [n for n, found in structure.plain_defs.items()
                       for d, _ in found if isinstance(d, FUNCTION_NODES)]
     every_function += [f"{i.name}.{n}" for i in structure.classes.values() for n in i.methods]
     for name in every_function:
-        if name in walker.callees:
+        if name in printed:
             continue
         made_calls = name in walker.any_calls or name in walker.built_in
         lines.append(f"{name} (no calls Zapple could identify)" if made_calls else f"{name} (no calls here)")
+
+    for owner, rows in untraced.items():
+        if owner not in printed:
+            lines.append(f"{owner} (no calls Zapple could identify)")
+            lines.extend(rows)
 
     unused = unused_names(structure, check_names)
     if unused:
@@ -1317,10 +1362,11 @@ def build_call_map(structure, walker, check_names):
         if structure.uses_dynamic_lookup:
             lines.append("(This code looks names up by text, for example with getattr, so some of these may be used that way.)")
     if any(callee.endswith("?") for callees in walker.callees.values() for callee in callees):
-        lines += ["", "? = a best guess: only one class in this code has a method with that name."]
-    if any(walker.not_followed.values()):
-        lines += ["", "Some calls could not be traced by reading the code. They are listed under the calling function. "
-                       "Only direct calls, self.method(), known object methods and one-step aliases are followed."]
+        lines += ["", "A name ending in ? is a suggested link: only one class in this code has a method with that name."]
+    if any(untraced.values()):
+        lines += ["", "Some calls could not be traced by reading the code. A ? at the start of a line marks such a call. "
+                       "Zapple follows only direct calls, self.method(), known object methods and one-step aliases (const fn = greet). "
+                       "Every other call is listed under the calling function as not traced."]
     return "\n".join(lines)
 
 def check_names_used(check_lines):
@@ -1589,3 +1635,203 @@ async def zapple_analyze(request_json):
         rules: LINT_FIX_RULES,
       });
     }
+
+    // ---------- Finding labels and the local log (no DOM code here) ----------
+    // Wording spec, section 1: every message carries a `basis` (the evidence, never a score),
+    // and a `kind`: "found" (Zapple saw it), "suggestion" (listed what it compared with) or
+    // "not-checked" (skipped, with a reason). These labels are added next to the original
+    // findings; the producers above are unchanged.
+
+    function kindOf(finding) {
+      // A sandbox that fails to start is an environment failure, not a code error.
+      if (finding.ruleId === "runtime" && /^The sandbox could not run the code/.test(finding.message)) return "not-checked";
+      return finding.severity === "error" ? "found" : "suggestion";
+    }
+
+    function basisFor(finding, context = {}) {
+      const id = finding.ruleId || "";
+      if (id === "runtime") {
+        if (/^The code did not finish/.test(finding.message)) return "the run was stopped at the time limit";
+        if (/^The sandbox could not run the code/.test(finding.message)) return "the sandbox itself failed to start";
+        return context.language === "python" ? "Zapple ran this code in the browser's Python" : "Zapple ran this code in a background sandbox";
+      }
+      if (id === "check") return "a line from the Checks box, run against this code";
+      if (id === "no-undef") return "compared with names declared in this code, the browser globals and the globals box";
+      if (id.startsWith("pyflakes/")) return `pyflakes ${id.slice("pyflakes/".length)}`;
+      if (id.startsWith("zapple/")) {
+        return context.language === "python"
+          ? "name defined once in this code and never reused as a variable or parameter"
+          : "read from this code's structure, without running it";
+      }
+      return `ESLint rule ${id}`;
+    }
+
+    // The name a finding is about, where the message makes that certain.
+    function subjectOf(finding) {
+      if (finding.ruleId === "no-undef" || finding.ruleId === "pyflakes/UndefinedName") {
+        const match = /'([^']+)'/.exec(finding.message);
+        return match ? match[1] : null;
+      }
+      return null;
+    }
+
+    /** Labels a finding without changing how it was produced. */
+    function labelFinding(finding, context) {
+      const subject = subjectOf(finding);
+      return {
+        ...finding,
+        kind: kindOf(finding),
+        basis: basisFor(finding, context),
+        subject,
+        key: `${finding.ruleId}|${subject ?? finding.message}`,   // survives line shifts
+      };
+    }
+
+    /** One log record per finished check (shape from the wording spec, section 5). */
+    function buildLogRecord({ language, sourceType, code, findings, run, session, seq, engine }) {
+      return {
+        v: 1,
+        session, seq,
+        t: Date.now(),
+        lang: language === "python" ? "python" : "js",
+        sourceType: sourceType ?? null,
+        lines: code.split("\n").length,
+        engine: engine ?? {},
+        ran: {
+          status: run?.status ?? "not-run",
+          ms: run?.durationMs ?? null,
+          skipReason: run?.reason ?? run?.skipReason ?? null,
+        },
+        findings: findings.map((finding) => labelFinding(finding, { language }))
+          .map(({ line, ruleId, kind, basis, subject, key, message }) =>
+            ({ key, rule: ruleId, kind, line, subject, message, basis })),
+      };
+    }
+
+    // ---------- Local log (wording spec, section 6) ----------
+    // Three IndexedDB stores: checks (last 200 records), counts (running totals per rule),
+    // pairs (name changes seen between consecutive checks). Everything is wrapped so the page
+    // works when storage is empty or blocked, and logging never breaks a check.
+    const ZapLog = (() => {
+      const DB = 'zapple-log', KEEP = 200;
+      let dbp = null, keepCode = false;
+      let prev = null; // in memory only, never saved: { session, code, findings }
+
+      function open() {
+        if (!dbp) dbp = new Promise(resolve => {
+          try {
+            const r = indexedDB.open(DB, 1);
+            r.onupgradeneeded = () => {
+              const db = r.result;
+              db.createObjectStore('checks', { keyPath: 'id' });
+              db.createObjectStore('counts', { keyPath: 'key' });
+              db.createObjectStore('pairs',  { keyPath: 'key' });
+            };
+            r.onsuccess = () => resolve(r.result);
+            r.onerror = r.onblocked = () => resolve(null);
+          } catch (e) { resolve(null); }
+        });
+        return dbp;
+      }
+
+      async function run(store, mode, fn) {
+        const db = await open();
+        if (!db) return null;
+        return new Promise(resolve => {
+          try {
+            const t = db.transaction(store, mode);
+            const out = fn(t.objectStore(store));
+            t.oncomplete = () => resolve(out && 'result' in out ? out.result : out);
+            t.onerror = t.onabort = () => resolve(null);
+          } catch (e) { resolve(null); }
+        });
+      }
+
+      const put = (s, v) => run(s, 'readwrite', o => o.put(v));
+      const get = (s, k) => run(s, 'readonly',  o => o.get(k));
+      const all = (s)    => run(s, 'readonly',  o => o.getAll());
+      const del = (s, k) => run(s, 'readwrite', o => o.delete(k));
+
+      async function bump(store, key, field, extra = {}) {
+        const cur = (await get(store, key)) || { key, ...extra };
+        cur[field] = (cur[field] || 0) + 1;
+        await put(store, cur);
+      }
+
+      async function hash(text) {
+        try {
+          const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+          return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+        } catch (e) { return 'nohash-' + text.length; }
+      }
+
+      // If exactly one identifier on the line changed, and it was the flagged one,
+      // return the identifier that replaced it. Otherwise null.
+      const ID = /[A-Za-z_$][\w$]*/g;
+      function swapped(prevLine, nextLine, subject) {
+        const a = prevLine.match(ID) || [], b = nextLine.match(ID) || [];
+        const as = new Set(a), bs = new Set(b);
+        const removed = a.filter(t => !bs.has(t)), added = b.filter(t => !as.has(t));
+        return removed.length === 1 && added.length === 1 && removed[0] === subject ? added[0] : null;
+      }
+
+      async function compare(p, rec, code) {
+        const now = new Set(rec.findings.map(f => f.key));
+        const pl = p.code.split('\n'), nl = code.split('\n');
+        for (const f of p.findings) {
+          const ck = rec.lang + '|' + f.rule;
+          if (now.has(f.key)) { await bump('counts', ck, 'stillNext'); continue; }
+          await bump('counts', ck, 'goneNext');
+          // only compare lines when the line count is unchanged, so lines still line up
+          if (f.subject && f.line && pl.length === nl.length) {
+            const to = swapped(pl[f.line - 1] || '', nl[f.line - 1] || '', f.subject);
+            if (to) await bump('pairs', f.rule + '|' + f.subject + '|' + to, 'n',
+                               { rule: f.rule, from: f.subject, to });
+          }
+        }
+      }
+
+      async function trim() {
+        const rows = await all('checks');
+        if (!rows || rows.length <= KEEP) return;
+        rows.sort((a, b) => a.t - b.t);
+        for (const r of rows.slice(0, rows.length - KEEP)) await del('checks', r.id);
+      }
+
+      return {
+        setKeepCode(v) { keepCode = !!v; },
+
+        // call once per finished check; rec follows the spec's section 5 shape without id/codeHash/code
+        async record(rec, code) {
+          try {
+            rec.id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+            rec.codeHash = await hash(code);
+            rec.code = keepCode ? code : null;
+            await put('checks', rec);
+            for (const f of rec.findings) await bump('counts', rec.lang + '|' + f.rule, 'shown');
+            if (prev && prev.session === rec.session) await compare(prev, rec, code);
+            prev = { session: rec.session, code, findings: rec.findings };
+            await trim();
+          } catch (e) { /* logging must never break a check */ }
+        },
+
+        // for the "Seen before" suggestion line
+        async seenFixes(rule, subject) {
+          const rows = (await all('pairs')) || [];
+          return rows.filter(p => p.rule === rule && p.from === subject)
+                     .sort((a, b) => b.n - a.n).slice(0, 3);
+        },
+
+        async exportJsonl() {
+          const out = [];
+          for (const s of ['checks', 'counts', 'pairs'])
+            for (const r of (await all(s)) || []) out.push(JSON.stringify({ store: s, ...r }));
+          return out.join('\n');
+        },
+
+        async clear() {
+          for (const s of ['checks', 'counts', 'pairs'])
+            for (const r of (await all(s)) || []) await del(s, r.key || r.id);
+        }
+      };
+    })();
