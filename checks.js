@@ -1,837 +1,1006 @@
 "use strict";
 
-    // ---------- Checking (no DOM code here) ----------
+// ============================================================================
+// Zapple Core Engine: Syntax, Static Rules, Structural Analysis & Sandbox
+// ============================================================================
 
-    /**
-     * Parses `code` and reports whether it is valid JavaScript syntax.
-     * Returns { ok: true } or { ok: false, problem: { message, line, column, sourceLine } }.
-     */
-    function checkSyntax(code, sourceType) {
-      try {
-        acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
-        return { ok: true };
-      } catch (error) {
-        if (!(error instanceof SyntaxError) || !error.loc) throw error;
-        return { ok: false, problem: describeProblem(error, code) };
-      }
+// ---------- Checking (no DOM code here) ----------
+
+/**
+ * Parses `code` and reports whether it is valid JavaScript syntax.
+ * Returns { ok: true } or { ok: false, problem: { message, line, column, sourceLine } }.
+ */
+function checkSyntax(code, sourceType) {
+  try {
+    acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
+    return { ok: true };
+  } catch (error) {
+    if (!(error instanceof SyntaxError) || !error.loc) throw error;
+    return { ok: false, problem: describeProblem(error, code) };
+  }
+}
+
+function describeProblem(error, code) {
+  const { line, column } = error.loc;   // acorn: line starts at 1, column at 0
+  return {
+    // acorn appends " (line:column)" to its messages; we show the location separately
+    message: error.message.replace(/\s*\(\d+:\d+\)$/, ""),
+    line,
+    column: column + 1,
+    sourceLine: code.split("\n")[line - 1] ?? "",
+  };
+}
+
+/**
+ * Zapple does not ask whether JavaScript is a module or a plain script; it finds out.
+ * Module is tried first because it is stricter and catches more. If Module rejects the code,
+ * Plain script gets a turn. Returns { ok: true, sourceType } or { ok: false, problem }.
+ */
+function checkSyntaxInBothModes(code, log) {
+  const asModule = checkSyntax(code, "module");
+  if (asModule.ok) return { ok: true, sourceType: "module" };
+
+  const asScript = checkSyntax(code, "script");
+  if (asScript.ok) {
+    log.add(`Module mode rejected the code (${asModule.problem.message}); plain script mode accepted it`);
+    return { ok: true, sourceType: "script" };
+  }
+  return { ok: false, problem: asModule.problem };   // both refused it: report the Module error
+}
+
+// ---------- Rule checks (no DOM code here) ----------
+
+// "error" problems are sent to the AI in the repair prompt.
+// "warn" notes are shown on screen only, so the AI is not asked to tidy code you didn't ask about.
+const ESLINT_RULES = {
+  // Code that fails or behaves wrongly
+  "no-undef": "error",
+  // Variables used before declaration (TDZ) flagged as error; functions/classes remain hoisted
+  "no-use-before-define": ["error", { functions: false, classes: false, variables: true }],
+  "no-const-assign": "error",
+  "no-redeclare": ["error", { builtinGlobals: false }],
+  "no-dupe-keys": "error",
+  "no-dupe-args": "error",
+  "no-dupe-class-members": "error",
+  "no-dupe-else-if": "error",
+  "no-import-assign": "error",
+  "no-unreachable": "error",
+  "no-unsafe-negation": "error",
+  "valid-typeof": "error",
+  "use-isnan": "error",
+  "getter-return": "error",
+  "constructor-super": "error",
+  "no-this-before-super": "error",
+  // Banned patterns
+  "no-eval": "error",
+  // Housekeeping
+  "no-unused-vars": ["warn", { vars: "local", args: "none", caughtErrors: "none" }],
+};
+
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+
+/** "THREE, Chart  d3" -> ["THREE", "Chart", "d3"] (anything that isn't a valid name is dropped) */
+function parseNameList(text) {
+  return text.split(/[\s,]+/).filter((name) => IDENTIFIER.test(name));
+}
+
+function buildLintConfig(sourceType, extraGlobals) {
+  const names = [...(typeof BROWSER_GLOBALS !== "undefined" ? BROWSER_GLOBALS : []), ...extraGlobals].filter((name) => IDENTIFIER.test(name));
+  return {
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType,
+      globals: Object.fromEntries(names.map((name) => [name, "readonly"])),
+    },
+    rules: ESLINT_RULES,
+  };
+}
+
+function toFinding(message) {
+  return {
+    line: message.line,
+    column: message.column,
+    message: message.message,
+    ruleId: message.ruleId,
+    severity: message.severity === 2 ? "error" : "note",
+  };
+}
+
+/**
+ * Runs the ESLint rules on code that already passed the syntax check.
+ * Returns { errors, notes }, each a list of { line, column, message, ruleId, severity }.
+ */
+function lintCode({ code, sourceType, extraGlobals }) {
+  const linter = new eslint.Linter({ configType: "flat" });
+  const config = buildLintConfig(sourceType, extraGlobals);
+  const findings = linter.verify(code, config, { filename: "input.js" }).map(toFinding);
+
+  return {
+    errors: findings.filter((finding) => finding.severity === "error"),
+    notes: findings.filter((finding) => finding.severity === "note"),
+  };
+}
+
+// ---------- Log ----------
+
+/** A running record of what Zapple does during a check, shown in the Log panel. */
+function createLog(outputElement) {
+  let startedAt = performance.now();
+  return {
+    reset() {
+      startedAt = performance.now();
+      outputElement.textContent = "";
+    },
+    add(message) {
+      const elapsed = Math.round(performance.now() - startedAt);
+      outputElement.textContent += `[+${elapsed} ms] ${message}\n`;
+    },
+  };
+}
+
+// ---------- Sandbox: test-run the code (no DOM code here) ----------
+
+window.RUN_TIMEOUT_MS = 3000;    // stop code that has not reached its last line by then
+const SETTLE_MS = 500;          // after the last line, wait for delayed errors (timers, promises)
+const MAX_OUTPUT_LINES = 200;
+
+// Browser features that code under test must not use: network access and stored data.
+// Both the JavaScript and the Python test areas block these same names.
+const BLOCKED_BROWSER_APIS = ["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "importScripts", "indexedDB", "caches"];
+
+// Names that only exist on a web page, so a worker cannot run code that uses them.
+const PAGE_ONLY_NAMES = new Set(["document", "window", "localStorage", "sessionStorage", "alert", "confirm", "prompt"]);
+
+/**
+ * Runs first inside the worker (it is copied into the worker as text).
+ * It captures console output, reports crashes, blocks network and storage access,
+ * and provides deep structural comparison for test assertions.
+ */
+function workerSetup(blockedNames) {
+  const send = (message) => self.postMessage(message);
+
+  const describe = (value) => {
+    if (typeof value === "string") return value;
+    if (value instanceof Error) return `${value.name}: ${value.message}`;
+    try { return JSON.stringify(value) ?? String(value); } catch { return String(value); }
+  };
+  self.zappleDescribe = describe;   // used by the generated check code
+
+  /** Deep structural comparison for checks (e.g. [1, 2] === [1, 2], { a: 1 } === { a: 1 }) */
+  function deepEqual(a, b, depth = 0) {
+    if (a === b) return true;
+    if (depth > 20) return false;
+    if (a === null || typeof a !== "object" || b === null || typeof b !== "object") {
+      return Number.isNaN(a) && Number.isNaN(b);
     }
+    if (a.constructor !== b.constructor) return false;
+    if (Array.isArray(a)) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (!deepEqual(a[i], b[i], depth + 1)) return false;
+      }
+      return true;
+    }
+    if (a instanceof Map && b instanceof Map) {
+      if (a.size !== b.size) return false;
+      for (const [k, v] of a) {
+        if (!b.has(k) || !deepEqual(v, b.get(k), depth + 1)) return false;
+      }
+      return true;
+    }
+    if (a instanceof Set && b instanceof Set) {
+      if (a.size !== b.size) return false;
+      for (const v of a) if (!b.has(v)) return false;
+      return true;
+    }
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    for (const k of keysA) {
+      if (!Object.prototype.hasOwnProperty.call(b, k) || !deepEqual(a[k], b[k], depth + 1)) return false;
+    }
+    return true;
+  }
+  self.zappleDeepEqual = deepEqual;
 
-    function describeProblem(error, code) {
-      const { line, column } = error.loc;   // acorn: line starts at 1, column at 0
+  for (const level of ["log", "info", "warn", "error", "debug"]) {
+    console[level] = (...args) => send({ type: "console", level, text: args.map(describe).join(" ") });
+  }
+
+  for (const name of blockedNames) {
+    Object.defineProperty(self, name, {
+      get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
+    });
+  }
+
+  const reportError = (error, line, column) => send({
+    type: "error",
+    name: error?.name ?? "Error",
+    message: error?.message ?? String(error),
+    stack: error?.stack ?? "",
+    line,
+    column,
+  });
+
+  self.addEventListener("error", (event) => {
+    event.preventDefault();
+    reportError(event.error ?? { message: event.message }, event.lineno, event.colno);
+  });
+  self.addEventListener("unhandledrejection", (event) => {
+    event.preventDefault();
+    reportError(event.reason);
+  });
+}
+
+const WORKER_PREAMBLE = `(${workerSetup.toString()})(${JSON.stringify(BLOCKED_BROWSER_APIS)});`;
+const PREAMBLE_LINES = WORKER_PREAMBLE.split("\n").length;   // user code starts on the next line
+
+function buildWorkerSource(code, checks) {
+  const checkSources = checks.map(buildCheckSource).join("\n");
+  return `${WORKER_PREAMBLE}\n${code}\n${checkSources}\nself.postMessage({ type: "finished" });`;
+}
+
+function checkFinding(message) {
+  return { line: null, column: null, message, ruleId: "check", severity: "error" };
+}
+
+/**
+ * Reads the Checks box (one JavaScript expression per line).
+ * Returns { checks, problems }: runnable checks, and findings for lines that are not valid expressions.
+ * A check written as `a === b` keeps both sides, so a failure can report what `a` actually was.
+ */
+function parseChecks(text) {
+  const checks = [];
+  const problems = [];
+  const lines = text.split("\n").map((line) => line.trim().replace(/;+$/, "")).filter(Boolean);
+
+  for (const source of lines) {
+    try {
+      const node = acorn.parseExpressionAt(source, 0, { ecmaVersion: "latest" });
+      if (source.slice(node.end).trim() !== "") throw new SyntaxError("only one expression per line");
+      const isEquality = node.type === "BinaryExpression" && (node.operator === "===" || node.operator === "==");
+      checks.push({
+        source,
+        left: isEquality ? source.slice(node.left.start, node.left.end) : null,
+        right: isEquality ? source.slice(node.right.start, node.right.end) : null,
+      });
+    } catch (error) {
+      problems.push(checkFinding(`Check is not a valid expression (${error.message.replace(/\s*\(\d+:\d+\)$/, "")}): ${source}`));
+    }
+  }
+  return { checks, problems };
+}
+
+/** Code appended to the user's code: evaluates one check and reports the result in an isolated block scope. */
+function buildCheckSource({ source, left, right }, index) {
+  if (left !== null) {
+    return `{
+      try {
+        const __zap_left = (${left});
+        const __zap_right = (${right});
+        const __zap_passed = (__zap_left === __zap_right) || self.zappleDeepEqual(__zap_left, __zap_right);
+        self.postMessage({ type: "check", index: ${index}, passed: __zap_passed, actual: self.zappleDescribe(__zap_left) });
+      } catch (error) {
+        self.postMessage({ type: "check", index: ${index}, passed: false, error: error.name + ": " + error.message });
+      }
+    }`;
+  }
+  return `{
+    try {
+      self.postMessage({ type: "check", index: ${index}, passed: Boolean((${source})) });
+    } catch (error) {
+      self.postMessage({ type: "check", index: ${index}, passed: false, error: error.name + ": " + error.message });
+    }
+  }`;
+}
+
+/** Findings for the checks that failed or crashed. */
+function failedCheckFindings(results, checks) {
+  return results.filter((result) => !result.passed).map((result) => {
+    const outcome = result.error
+      ? `crashed with ${result.error}`
+      : result.actual !== undefined ? `failed (got ${result.actual})` : "failed";
+    return checkFinding(`Check ${outcome}: ${checks[result.index].source}`);
+  });
+}
+
+/** The reason this code cannot be test-run yet, or null if it can. */
+function findSkipReason(code, sourceType) {
+  const tokens = [...acorn.tokenizer(code, { ecmaVersion: "latest", sourceType })];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    const previous = tokens[index - 1];
+    const next = tokens[index + 1];
+    if (token.type === acorn.tokTypes._import) {
       return {
-        // acorn appends " (line:column)" to its messages; we show the location separately
-        message: error.message.replace(/\s*\(\d+:\d+\)$/, ""),
-        line,
-        column: column + 1,
-        sourceLine: code.split("\n")[line - 1] ?? "",
+        reason: "it uses import, which loads other files or libraries. Zapple's test area cannot load them yet, so it cannot run this code.",
+        tip: "If the import is only for a helper you can copy, paste that helper into the box instead.",
       };
     }
+    const afterDot = Boolean(previous)
+      && (previous.type === acorn.tokTypes.dot || previous.type === acorn.tokTypes.questionDot);
+    const isKeyOrLabel = Boolean(next) && next.type === acorn.tokTypes.colon;
+    if (token.type === acorn.tokTypes.name && PAGE_ONLY_NAMES.has(token.value) && !afterDot && !isKeyOrLabel) {
+      return {
+        reason: `it uses "${token.value}", which only exists inside a web page. Zapple tests code in a separate background area that has no web page, so this line would crash there even if it is correct on your site.`,
+        tip: "Test the logic separately: paste only the functions that calculate or handle data, and use Checks on them. The lines that touch the page are still covered by the syntax, rule and structure checks.",
+      };
+    }
+  }
+  return null;
+}
 
-    /**
-     * Zapple does not ask whether JavaScript is a module or a plain script; it finds out.
-     * Module is tried first because it is stricter and catches more. If Module rejects the code,
-     * Plain script gets a turn. Returns { ok: true, sourceType } or { ok: false, problem }.
-     */
-    function checkSyntaxInBothModes(code, log) {
-      const asModule = checkSyntax(code, "module");
-      if (asModule.ok) return { ok: true, sourceType: "module" };
+window.FIX_FIRST = {
+  reason: "the checks above found errors, and running code that is already known to be broken would only repeat the same problem.",
+  tip: "Fix the errors (the repair prompt does this) and check again.",
+};
 
-      const asScript = checkSyntax(code, "script");
-      if (asScript.ok) {
-        log.add(`Module mode rejected the code (${asModule.problem.message}); plain script mode accepted it`);
-        return { ok: true, sourceType: "script" };
-      }
-      return { ok: false, problem: asModule.problem };   // both refused it: report the Module error
+function skippedRun(reason, tip) {
+  return { status: "skipped", reason, tip, errors: [], output: [], durationMs: 0, checkCount: 0 };
+}
+
+function runtimeFinding(message, line = null, column = null) {
+  return { line, column, message, ruleId: "runtime", severity: "error" };
+}
+
+/** Line/column pairs found in an error's stack trace, in the order they appear. */
+function framesFromStack(stack) {
+  return [...stack.matchAll(/blob:\S*?:(\d+):(\d+)/g)]
+    .map(([, line, column]) => ({ line: Number(line), column: Number(column) }));
+}
+
+/** Turns a crash report from the worker into a finding, with the line mapped back to the user's code. */
+function toRuntimeFinding({ name, message, stack, line, column }) {
+  const frames = [...(line ? [{ line, column }] : []), ...framesFromStack(stack)];
+  const frame = frames.find((candidate) => candidate.line > PREAMBLE_LINES);
+  const text = `${name}: ${message}`;
+  return frame ? runtimeFinding(text, frame.line - PREAMBLE_LINES, frame.column) : runtimeFinding(text);
+}
+
+/**
+ * Runs `code` in a Web Worker and reports what happened.
+ * Resolves with { status, errors, output, durationMs, reason? }.
+ * status: "finished" | "crashed" | "timeout" | "skipped"
+ */
+function runInSandbox({ code, sourceType, checksText, log }) {
+  const skip = findSkipReason(code, sourceType);
+  if (skip) return Promise.resolve(skippedRun(skip.reason, skip.tip));
+  const parsedChecks = parseChecks(checksText);
+
+  return new Promise((resolve) => {
+    const startedAt = performance.now();
+    const output = [];
+    const errors = [...parsedChecks.problems];
+    const checkResults = [];
+    const url = URL.createObjectURL(new Blob([buildWorkerSource(code, parsedChecks.checks)], { type: "text/javascript" }));
+    const worker = new Worker(url, { type: sourceType === "module" ? "module" : "classic" });
+    let timeoutTimer = null;
+    let settleTimer = null;
+
+    function finish(status) {
+      clearTimeout(timeoutTimer);
+      clearTimeout(settleTimer);
+      worker.terminate();
+      URL.revokeObjectURL(url);
+      const durationMs = Math.round(performance.now() - startedAt);
+      log.add(`Sandbox result: ${status} (${durationMs} ms)`);
+      resolve({ status, errors, output, durationMs, checkCount: parsedChecks.checks.length });
     }
 
-    // ---------- Rule checks (no DOM code here) ----------
+    function recordCrash(finding) {
+      errors.push(finding);
+      log.add(`Crash: ${finding.message}${finding.line ? ` (line ${finding.line})` : ""}`);
+      finish("crashed");
+    }
 
-    // "error" problems are sent to the AI in the repair prompt.
-    // "warn" notes are shown on screen only, so the AI is not asked to tidy code you didn't ask about.
-    const ESLINT_RULES = {
-      // Code that fails or behaves wrongly
-      "no-undef": "error",
-      "no-use-before-define": ["error", { functions: false, classes: false, variables: false }],
-      "no-const-assign": "error",
-      "no-redeclare": ["error", { builtinGlobals: false }],
-      "no-dupe-keys": "error",
-      "no-dupe-args": "error",
-      "no-dupe-class-members": "error",
-      "no-dupe-else-if": "error",
-      "no-import-assign": "error",
-      "no-unreachable": "error",
-      "no-unsafe-negation": "error",
-      "valid-typeof": "error",
-      "use-isnan": "error",
-      "getter-return": "error",
-      "constructor-super": "error",
-      "no-this-before-super": "error",
-      // Banned patterns
-      "no-eval": "error",
-      // Housekeeping
-      "no-unused-vars": ["warn", { vars: "local", args: "none", caughtErrors: "none" }],
+    worker.onmessage = ({ data }) => {
+      if (data.type === "console" && output.length < MAX_OUTPUT_LINES) {
+        output.push(data.level === "log" ? data.text : `[${data.level}] ${data.text}`);
+        log.add(`console.${data.level}: ${data.text}`);
+      } else if (data.type === "error") {
+        recordCrash(toRuntimeFinding(data));
+      } else if (data.type === "check") {
+        checkResults.push(data);
+        log.add(`Check ${data.passed ? "passed" : "failed"}: ${parsedChecks.checks[data.index].source}`);
+      } else if (data.type === "finished") {
+        clearTimeout(timeoutTimer);
+        log.add("Code reached its last line; waiting for delayed errors");
+        settleTimer = setTimeout(() => {
+          errors.push(...failedCheckFindings(checkResults, parsedChecks.checks));
+          finish("finished");
+        }, SETTLE_MS);
+      }
     };
 
-    const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+    worker.onerror = (event) => {
+      event.preventDefault();
+      recordCrash(runtimeFinding(`The sandbox could not run the code: ${event.message || "unknown error"}`));
+    };
 
-    /** "THREE, Chart  d3" -> ["THREE", "Chart", "d3"] (anything that isn't a valid name is dropped) */
-    function parseNameList(text) {
-      return text.split(/[\s,]+/).filter((name) => IDENTIFIER.test(name));
+    timeoutTimer = setTimeout(() => {
+      errors.push(runtimeFinding(
+        `The code did not finish within ${RUN_TIMEOUT_MS / 1000} seconds (possible infinite loop or endless wait)`
+      ));
+      log.add("Timeout: the code did not reach its last line");
+      finish("timeout");
+    }, RUN_TIMEOUT_MS);
+
+    log.add(`Sandbox started (limit ${RUN_TIMEOUT_MS / 1000} s)`);
+  });
+}
+
+// ---------- Structure checks and call map (no DOM code here) ----------
+
+const FUNCTION_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+const isFunction = (node) => Boolean(node) && FUNCTION_TYPES.has(node.type);
+const isClass = (node) => node.type === "ClassDeclaration" || node.type === "ClassExpression";
+
+/** Visits every node in the syntax tree. The visitor has `enter(node)` and `leave(node)`. */
+function walkTree(node, visitor) {
+  if (!node || typeof node !== "object") return;
+  visitor.enter(node);
+  for (const value of Object.values(node)) {
+    for (const child of Array.isArray(value) ? value : [value]) {
+      if (child && typeof child.type === "string") walkTree(child, visitor);
     }
+  }
+  visitor.leave(node);
+}
 
-    function buildLintConfig(sourceType, extraGlobals) {
-      const names = [...BROWSER_GLOBALS, ...extraGlobals].filter((name) => IDENTIFIER.test(name));
-      return {
-        languageOptions: {
-          ecmaVersion: "latest",
-          sourceType,
-          globals: Object.fromEntries(names.map((name) => [name, "readonly"])),
-        },
-        rules: ESLINT_RULES,
-      };
+/**
+ * How many arguments a function accepts.
+ * Required parameters are positional parameters up to the last parameter without a default/rest.
+ */
+function argumentRange(fn) {
+  let lastRequiredIdx = -1;
+  for (let i = 0; i < fn.params.length; i++) {
+    const p = fn.params[i];
+    if (p.type !== "AssignmentPattern" && p.type !== "RestElement") {
+      lastRequiredIdx = i;
     }
+  }
+  const min = lastRequiredIdx + 1;
+  const hasRest = fn.params.some((p) => p.type === "RestElement");
+  return { min, max: hasRest ? Infinity : fn.params.length };
+}
 
-    function toFinding(message) {
-      return {
-        line: message.line,
-        column: message.column,
-        message: message.message,
-        ruleId: message.ruleId,
-        severity: message.severity === 2 ? "error" : "note",
-      };
-    }
+/**
+ * Extracts all identifiers read within an expression (used for loop invariant checking).
+ */
+function collectIdentifiers(node) {
+  const names = new Set();
+  walkTree(node, {
+    enter(n) {
+      if (n.type === "Identifier") names.add(n.name);
+    },
+    leave() {},
+  });
+  return names;
+}
 
-    /**
-     * Runs the ESLint rules on code that already passed the syntax check.
-     * Returns { errors, notes }, each a list of { line, column, message, ruleId, severity }.
-     */
-    function lintCode({ code, sourceType, extraGlobals }) {
-      const linter = new eslint.Linter({ configType: "flat" });
-      const config = buildLintConfig(sourceType, extraGlobals);
-      const findings = linter.verify(code, config, { filename: "input.js" }).map(toFinding);
+/**
+ * Checks if any of the given variable names are modified within a block, or if it breaks/returns.
+ */
+function bodyModifiesAny(bodyNode, varNames) {
+  let modified = false;
+  let hasExit = false;
 
-      return {
-        errors: findings.filter((finding) => finding.severity === "error"),
-        notes: findings.filter((finding) => finding.severity === "note"),
-      };
-    }
-
-    // ---------- Log ----------
-
-    /** A running record of what Zapple does during a check, shown in the Log panel. */
-    function createLog(outputElement) {
-      let startedAt = performance.now();
-      return {
-        reset() {
-          startedAt = performance.now();
-          outputElement.textContent = "";
-        },
-        add(message) {
-          const elapsed = Math.round(performance.now() - startedAt);
-          outputElement.textContent += `[+${elapsed} ms] ${message}\n`;
-        },
-      };
-    }
-
-    // ---------- Sandbox: test-run the code (no DOM code here) ----------
-
-    window.RUN_TIMEOUT_MS = 3000;    // stop code that has not reached its last line by then
-    const SETTLE_MS = 500;          // after the last line, wait for delayed errors (timers, promises)
-    const MAX_OUTPUT_LINES = 200;
-
-    // Browser features that code under test must not use: network access and stored data.
-    // Both the JavaScript and the Python test areas block these same names.
-    const BLOCKED_BROWSER_APIS = ["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "importScripts", "indexedDB", "caches"];
-
-    // Names that only exist on a web page, so a worker cannot run code that uses them.
-    const PAGE_ONLY_NAMES = new Set(["document", "window", "localStorage", "sessionStorage", "alert", "confirm", "prompt"]);
-
-    /**
-     * Runs first inside the worker (it is copied into the worker as text).
-     * It captures console output, reports crashes, and blocks network and storage access.
-     */
-    function workerSetup(blockedNames) {
-      const send = (message) => self.postMessage(message);
-
-      const describe = (value) => {
-        if (typeof value === "string") return value;
-        if (value instanceof Error) return `${value.name}: ${value.message}`;
-        try { return JSON.stringify(value) ?? String(value); } catch { return String(value); }
-      };
-      self.zappleDescribe = describe;   // used by the generated check code
-
-      for (const level of ["log", "info", "warn", "error", "debug"]) {
-        console[level] = (...args) => send({ type: "console", level, text: args.map(describe).join(" ") });
+  walkTree(bodyNode, {
+    enter(n) {
+      if (n.type === "AssignmentExpression") {
+        if (n.left.type === "Identifier" && varNames.has(n.left.name)) modified = true;
+      } else if (n.type === "UpdateExpression") {
+        if (n.argument.type === "Identifier" && varNames.has(n.argument.name)) modified = true;
+      } else if (n.type === "BreakStatement" || n.type === "ReturnStatement" || n.type === "ThrowStatement") {
+        hasExit = true;
       }
+    },
+    leave() {},
+  });
 
-      for (const name of blockedNames) {
-        Object.defineProperty(self, name, {
-          get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
+  return { modified, hasExit };
+}
+
+/**
+ * Reads the code's structure without running it: which functions exist (including functions
+ * inside object literals, listed as "service.greet"), which classes have which methods, and
+ * who calls whom. Assumes the code already passed the syntax check.
+ */
+function analyzeStructure(code, sourceType) {
+  const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
+  const structure = {
+    functions: new Map(),        // name or "service.greet" -> { min, max } arguments accepted
+    functionCount: new Map(),    // how many times each name was defined; a name defined twice is ambiguous
+    asyncFunctions: new Set(),   // names of functions declared async
+    calls: [],                   // direct calls to plain names
+    methodCalls: [],             // this.method() calls
+    memberCalls: [],             // obj.method() calls where obj is a plain name
+    superCalls: [],              // super.method() calls
+    newCalls: [],                // new X() calls
+    otherCalls: [],              // calls that can only be traced by guessing
+    unawaitedCalls: [],          // async functions called and dereferenced without await
+    loopInvariants: [],          // while loops whose conditions are never mutated
+    loopShadowing: [],           // nested loops that reuse the same index variable
+    classes: new Map(),          // class name -> { name, members, hasParent, parentName }
+    aliases: new Map(),          // alias -> { kind: "name", target } or { kind: "member", object, method }
+    shorthandTargets: new Map(), // "obj.method" written as shorthand { method } -> the outer function name
+    objectMembers: new Map(),    // object literal name -> Set of member names it has
+    declared: new Set(),         // every name this code declares itself
+    nameCounts: new Map(),       // how often each name appears anywhere in the code
+    exported: new Set(),         // names exported from a module
+    callOwners: new Set(),       // owners whose body contains at least one call of any kind
+  };
+
+  const owners = [];
+  const classes = [];
+  const objects = [];
+  const loopVars = [];
+  const currentClass = () => classes.at(-1);
+  const currentObject = () => objects.at(-1);
+  const currentOwner = () => owners.at(-1) ?? "(top level)";
+  const whereOf = (node) => ({ line: node.loc.start.line, column: node.loc.start.column + 1, owner: currentOwner() });
+
+  function ownerOf(node) {
+    if (node.type === "FunctionDeclaration") return node.id?.name ?? null;
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && isFunction(node.init)) return node.id.name;
+    if (node.type === "MethodDefinition" && !node.computed && node.key.type === "Identifier") {
+      return `${currentClass()?.name}.${node.key.name}`;
+    }
+    return objectMethodName(node);
+  }
+
+  function objectMethodName(node) {
+    const isNamedFunction = node.type === "Property" && isFunction(node.value) && !node.computed && node.key.type === "Identifier";
+    return isNamedFunction && currentObject() ? `${currentObject()}.${node.key.name}` : null;
+  }
+
+  function objectNameOf(node) {
+    const isObject = node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init?.type === "ObjectExpression";
+    return isObject ? node.id.name : null;
+  }
+
+  function defineFunction(node) {
+    let name = null;
+    if (node.type === "FunctionDeclaration" && node.id) {
+      name = node.id.name;
+    } else if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && isFunction(node.init)) {
+      name = node.id.name;
+    } else if (objectMethodName(node)) {
+      name = objectMethodName(node);
+    }
+    if (!name) return;
+    structure.functionCount.set(name, (structure.functionCount.get(name) ?? 0) + 1);
+    const fn = node.init ?? node.value ?? node;
+    structure.functions.set(name, argumentRange(fn));
+    if (fn.async) {
+      structure.asyncFunctions.add(name);
+    }
+  }
+
+  function noteObjectMember(node) {
+    if (node.type !== "Property" || node.computed || node.key.type !== "Identifier" || !currentObject()) return;
+    const object = currentObject();
+    if (!structure.objectMembers.has(object)) structure.objectMembers.set(object, new Set());
+    structure.objectMembers.get(object).add(node.key.name);
+    if (node.shorthand && node.value.type === "Identifier") {
+      structure.shorthandTargets.set(`${object}.${node.key.name}`, node.value.name);
+    }
+  }
+
+  function noteDeclarations(node) {
+    const declare = (pattern) => {
+      if (!pattern) return;
+      if (pattern.type === "Identifier") structure.declared.add(pattern.name);
+      else if (pattern.type === "AssignmentPattern") declare(pattern.left);
+      else if (pattern.type === "RestElement") declare(pattern.argument);
+      else if (pattern.type === "ArrayPattern") pattern.elements.forEach(declare);
+      else if (pattern.type === "ObjectPattern") pattern.properties.forEach((property) => declare(property.value ?? property.argument));
+    };
+
+    if (node.type === "VariableDeclarator") declare(node.id);
+    else if (node.type === "CatchClause") declare(node.param);
+    else if (node.type.startsWith("Import") && node.local) structure.declared.add(node.local.name);
+    else if (isFunction(node)) {
+      declare(node.id);
+      node.params.forEach(declare);
+    }
+    if (node.type === "VariableDeclaration" && node.kind === "const") {
+      for (const declarator of node.declarations) {
+        if (declarator.id.type !== "Identifier" || !declarator.init) continue;
+        if (declarator.init.type === "Identifier") {
+          structure.aliases.set(declarator.id.name, { kind: "name", target: declarator.init.name });
+        } else if (declarator.init.type === "MemberExpression" && declarator.init.object.type === "Identifier"
+            && !declarator.init.computed && declarator.init.property.type === "Identifier") {
+          structure.aliases.set(declarator.id.name, {
+            kind: "member", object: declarator.init.object.name, method: declarator.init.property.name,
+          });
+        }
+      }
+    }
+  }
+
+  function rememberThisAssignment({ left }) {
+    const isThisProperty = left.type === "MemberExpression" && left.object.type === "ThisExpression"
+      && !left.computed && left.property.type === "Identifier";
+    if (isThisProperty) currentClass()?.members.add(left.property.name);
+  }
+
+  function recordCall(node) {
+    const { callee } = node;
+    const where = whereOf(node);
+    structure.callOwners.add(where.owner);
+
+    for (const argument of node.arguments) {
+      if (argument.type === "Identifier") structure.otherCalls.push({ ...where, kind: "passed", name: argument.name });
+    }
+
+    if (callee.type === "Identifier") {
+      const hasSpread = node.arguments.some((argument) => argument.type === "SpreadElement");
+      structure.calls.push({ ...where, name: callee.name, argCount: node.arguments.length, hasSpread });
+    } else if (callee.type === "MemberExpression") {
+      recordMemberCall(callee, where, node);
+    }
+  }
+
+  function recordMemberCall(callee, where, node) {
+    const method = !callee.computed && callee.property.type === "Identifier" ? callee.property.name : null;
+    const argCount = node.arguments.length;
+    const hasSpread = node.arguments.some((argument) => argument.type === "SpreadElement");
+
+    // Detect calling an un-awaited async function and immediately dereferencing its property
+    if (callee.object.type === "CallExpression" && callee.object.callee.type === "Identifier") {
+      const innerName = callee.object.callee.name;
+      if (structure.asyncFunctions.has(innerName)) {
+        structure.unawaitedCalls.push({
+          ...where,
+          name: innerName,
+          property: method || "[property]",
         });
       }
-
-      const reportError = (error, line, column) => send({
-        type: "error",
-        name: error?.name ?? "Error",
-        message: error?.message ?? String(error),
-        stack: error?.stack ?? "",
-        line,
-        column,
-      });
-
-      self.addEventListener("error", (event) => {
-        event.preventDefault();
-        reportError(event.error ?? { message: event.message }, event.lineno, event.colno);
-      });
-      self.addEventListener("unhandledrejection", (event) => {
-        event.preventDefault();
-        reportError(event.reason);
-      });
     }
 
-    const WORKER_PREAMBLE = `(${workerSetup.toString()})(${JSON.stringify(BLOCKED_BROWSER_APIS)});`;
-    const PREAMBLE_LINES = WORKER_PREAMBLE.split("\n").length;   // user code starts on the next line
-
-    function buildWorkerSource(code, checks) {
-      const checkSources = checks.map(buildCheckSource).join("\n");
-      return `${WORKER_PREAMBLE}\n${code}\n${checkSources}\nself.postMessage({ type: "finished" });`;
+    if (callee.object.type === "ThisExpression" && method && currentClass()) {
+      structure.methodCalls.push({ ...where, cls: currentClass(), method, argCount, hasSpread });
+    } else if (callee.object.type === "Super" && method && currentClass()) {
+      structure.superCalls.push({ ...where, cls: currentClass(), method, argCount, hasSpread });
+    } else if (callee.object.type === "Identifier" && method) {
+      structure.memberCalls.push({ ...where, object: callee.object.name, method, argCount, hasSpread });
+    } else {
+      structure.otherCalls.push({ ...where, kind: "dynamic", text: method ? `….${method}()` : "[…]()" });
     }
+  }
 
-    function checkFinding(message) {
-      return { line: null, column: null, message, ruleId: "check", severity: "error" };
-    }
+  function recordExports({ declaration, specifiers = [] }) {
+    const names = [
+      declaration?.id?.name,
+      declaration?.name,
+      ...(declaration?.declarations ?? []).map((declarator) => declarator.id.name),
+      ...specifiers.map((specifier) => specifier.local.name),
+    ];
+    names.filter(Boolean).forEach((name) => structure.exported.add(name));
+  }
 
-    /**
-     * Reads the Checks box (one JavaScript expression per line).
-     * Returns { checks, problems }: runnable checks, and findings for lines that are not valid expressions.
-     * A check written as `a === b` keeps both sides, so a failure can report what `a` actually was.
-     */
-    function parseChecks(text) {
-      const checks = [];
-      const problems = [];
-      const lines = text.split("\n").map((line) => line.trim().replace(/;+$/, "")).filter(Boolean);
-
-      for (const source of lines) {
-        try {
-          const node = acorn.parseExpressionAt(source, 0, { ecmaVersion: "latest" });
-          if (source.slice(node.end).trim() !== "") throw new SyntaxError("only one expression per line");
-          const isEquality = node.type === "BinaryExpression" && node.operator === "===";
-          checks.push({
-            source,
-            left: isEquality ? source.slice(node.left.start, node.left.end) : null,
-            right: isEquality ? source.slice(node.right.start, node.right.end) : null,
-          });
-        } catch (error) {
-          problems.push(checkFinding(`Check is not a valid expression (${error.message.replace(/\s*\(\d+:\d+\)$/, "")}): ${source}`));
-        }
+  walkTree(ast, {
+    enter(node) {
+      if (node.type === "Identifier") {
+        structure.nameCounts.set(node.name, (structure.nameCounts.get(node.name) ?? 0) + 1);
+      } else if (isClass(node)) {
+        const info = {
+          name: node.id?.name ?? "(anonymous class)", members: new Set(), hasParent: Boolean(node.superClass),
+          parentName: node.superClass?.type === "Identifier" ? node.superClass.name : null,
+        };
+        classes.push(info);
+        if (node.id) structure.classes.set(info.name, info);
+      } else if (node.type === "MethodDefinition" || node.type === "PropertyDefinition") {
+        if (!node.computed && node.key.type === "Identifier") currentClass()?.members.add(node.key.name);
+      } else if (node.type === "AssignmentExpression") {
+        rememberThisAssignment(node);
+      } else if (node.type === "CallExpression") {
+        recordCall(node);
+      } else if (node.type === "NewExpression" && node.callee.type === "Identifier") {
+        structure.newCalls.push({ ...whereOf(node), name: node.callee.name });
+        structure.callOwners.add(currentOwner());
+      } else if (node.type === "ExportNamedDeclaration" || node.type === "ExportDefaultDeclaration") {
+        recordExports(node);
       }
-      return { checks, problems };
-    }
 
-    /** Code appended to the user's code: evaluates one check and reports the result. */
-    function buildCheckSource({ source, left, right }, index) {
-      const report = left !== null
-        ? `const left = (${left}); const right = (${right}); self.postMessage({ type: "check", index: ${index}, passed: left === right, actual: self.zappleDescribe(left) });`
-        : `self.postMessage({ type: "check", index: ${index}, passed: Boolean((${source})) });`;
-      return `try { ${report} } catch (error) { self.postMessage({ type: "check", index: ${index}, passed: false, error: error.name + ": " + error.message }); }`;
-    }
-
-    /** Findings for the checks that failed or crashed. */
-    function failedCheckFindings(results, checks) {
-      return results.filter((result) => !result.passed).map((result) => {
-        const outcome = result.error
-          ? `crashed with ${result.error}`
-          : result.actual !== undefined ? `failed (got ${result.actual})` : "failed";
-        return checkFinding(`Check ${outcome}: ${checks[result.index].source}`);
-      });
-    }
-
-    /** The reason this code cannot be test-run yet, or null if it can. */
-    function findSkipReason(code, sourceType) {
-      const tokens = [...acorn.tokenizer(code, { ecmaVersion: "latest", sourceType })];
-      for (let index = 0; index < tokens.length; index++) {
-        const token = tokens[index];
-        const previous = tokens[index - 1];
-        const next = tokens[index + 1];
-        if (token.type === acorn.tokTypes._import) {
-          return {
-            reason: "it uses import, which loads other files or libraries. Zapple's test area cannot load them yet, so it cannot run this code.",
-            tip: "If the import is only for a helper you can copy, paste that helper into the box instead.",
-          };
-        }
-        // A page-only name only counts as real use when it is not a property access
-        // (obj.window, obj?.document) and not an object key or label ({ document: 1 }).
-        const afterDot = Boolean(previous)
-          && (previous.type === acorn.tokTypes.dot || previous.type === acorn.tokTypes.questionDot);
-        const isKeyOrLabel = Boolean(next) && next.type === acorn.tokTypes.colon;
-        if (token.type === acorn.tokTypes.name && PAGE_ONLY_NAMES.has(token.value) && !afterDot && !isKeyOrLabel) {
-          return {
-            reason: `it uses "${token.value}", which only exists inside a web page. Zapple tests code in a separate background area that has no web page, so this line would crash there even if it is correct on your site.`,
-            tip: "Test the logic separately: paste only the functions that calculate or handle data, and use Checks on them. The lines that touch the page are still covered by the syntax, rule and structure checks.",
-          };
-        }
-      }
-      return null;
-    }
-
-    window.FIX_FIRST = {
-      reason: "the checks above found errors, and running code that is already known to be broken would only repeat the same problem.",
-      tip: "Fix the errors (the repair prompt does this) and check again.",
-    };
-
-    function skippedRun(reason, tip) {
-      return { status: "skipped", reason, tip, errors: [], output: [], durationMs: 0, checkCount: 0 };
-    }
-
-    function runtimeFinding(message, line = null, column = null) {
-      return { line, column, message, ruleId: "runtime", severity: "error" };
-    }
-
-    /** Line/column pairs found in an error's stack trace, in the order they appear. */
-    function framesFromStack(stack) {
-      return [...stack.matchAll(/blob:\S*?:(\d+):(\d+)/g)]
-        .map(([, line, column]) => ({ line: Number(line), column: Number(column) }));
-    }
-
-    /** Turns a crash report from the worker into a finding, with the line mapped back to the user's code. */
-    function toRuntimeFinding({ name, message, stack, line, column }) {
-      const frames = [...(line ? [{ line, column }] : []), ...framesFromStack(stack)];
-      const frame = frames.find((candidate) => candidate.line > PREAMBLE_LINES);   // skip Zapple's own setup lines
-      const text = `${name}: ${message}`;
-      return frame ? runtimeFinding(text, frame.line - PREAMBLE_LINES, frame.column) : runtimeFinding(text);
-    }
-
-    /**
-     * Runs `code` in a Web Worker and reports what happened.
-     * Resolves with { status, errors, output, durationMs, reason? }.
-     * status: "finished" | "crashed" | "timeout" | "skipped"
-     */
-    function runInSandbox({ code, sourceType, checksText, log }) {
-      const skip = findSkipReason(code, sourceType);
-      if (skip) return Promise.resolve(skippedRun(skip.reason, skip.tip));
-      const parsedChecks = parseChecks(checksText);
-
-      return new Promise((resolve) => {
-        const startedAt = performance.now();
-        const output = [];
-        const errors = [...parsedChecks.problems];
-        const checkResults = [];
-        const url = URL.createObjectURL(new Blob([buildWorkerSource(code, parsedChecks.checks)], { type: "text/javascript" }));
-        const worker = new Worker(url, { type: sourceType === "module" ? "module" : "classic" });
-        let timeoutTimer = null;
-        let settleTimer = null;
-
-        function finish(status) {
-          clearTimeout(timeoutTimer);
-          clearTimeout(settleTimer);
-          worker.terminate();
-          URL.revokeObjectURL(url);
-          const durationMs = Math.round(performance.now() - startedAt);
-          log.add(`Sandbox result: ${status} (${durationMs} ms)`);
-          resolve({ status, errors, output, durationMs, checkCount: parsedChecks.checks.length });
-        }
-
-        function recordCrash(finding) {
-          errors.push(finding);
-          log.add(`Crash: ${finding.message}${finding.line ? ` (line ${finding.line})` : ""}`);
-          finish("crashed");
-        }
-
-        worker.onmessage = ({ data }) => {
-          if (data.type === "console" && output.length < MAX_OUTPUT_LINES) {
-            output.push(data.level === "log" ? data.text : `[${data.level}] ${data.text}`);
-            log.add(`console.${data.level}: ${data.text}`);
-          } else if (data.type === "error") {
-            recordCrash(toRuntimeFinding(data));
-          } else if (data.type === "check") {
-            checkResults.push(data);
-            log.add(`Check ${data.passed ? "passed" : "failed"}: ${parsedChecks.checks[data.index].source}`);
-          } else if (data.type === "finished") {
-            // The code reached its last line, so the "did not finish" timer is no longer
-            // relevant; only the settle window for delayed errors remains. Without this,
-            // code finishing between ~2.5 s and 3 s is wrongly reported as a timeout.
-            clearTimeout(timeoutTimer);
-            log.add("Code reached its last line; waiting for delayed errors");
-            settleTimer = setTimeout(() => {
-              errors.push(...failedCheckFindings(checkResults, parsedChecks.checks));
-              finish("finished");
-            }, SETTLE_MS);
+      // Check loop invariants in while loops (e.g. while (low <= high))
+      if (node.type === "WhileStatement" && node.test && node.body) {
+        const testVars = collectIdentifiers(node.test);
+        if (testVars.size > 0 && !testVars.has("true")) {
+          const { modified, hasExit } = bodyModifiesAny(node.body, testVars);
+          if (!modified && !hasExit) {
+            structure.loopInvariants.push({
+              ...whereOf(node),
+              vars: [...testVars],
+            });
           }
-        };
-
-        // Fires when the worker cannot start at all (for example, a browser without module workers)
-        worker.onerror = (event) => {
-          event.preventDefault();
-          recordCrash(runtimeFinding(`The sandbox could not run the code: ${event.message || "unknown error"}`));
-        };
-
-        timeoutTimer = setTimeout(() => {
-          errors.push(runtimeFinding(
-            `The code did not finish within ${RUN_TIMEOUT_MS / 1000} seconds (possible infinite loop or endless wait)`
-          ));
-          log.add("Timeout: the code did not reach its last line");
-          finish("timeout");
-        }, RUN_TIMEOUT_MS);
-
-        log.add(`Sandbox started (limit ${RUN_TIMEOUT_MS / 1000} s)`);
-      });
-    }
-
-    // ---------- Structure checks and call map (no DOM code here) ----------
-
-    const FUNCTION_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
-    const isFunction = (node) => Boolean(node) && FUNCTION_TYPES.has(node.type);
-    const isClass = (node) => node.type === "ClassDeclaration" || node.type === "ClassExpression";
-
-    /** Visits every node in the syntax tree. The visitor has `enter(node)` and `leave(node)`. */
-    function walkTree(node, visitor) {
-      visitor.enter(node);
-      for (const value of Object.values(node)) {
-        for (const child of Array.isArray(value) ? value : [value]) {
-          if (child && typeof child.type === "string") walkTree(child, visitor);
-        }
-      }
-      visitor.leave(node);
-    }
-
-    /** How many arguments a function accepts. Parameters with defaults, and rest parameters, are optional. */
-    function argumentRange(fn) {
-      const optionalAt = fn.params.findIndex((p) => p.type === "AssignmentPattern" || p.type === "RestElement");
-      const hasRest = fn.params.some((p) => p.type === "RestElement");
-      return { min: optionalAt === -1 ? fn.params.length : optionalAt, max: hasRest ? Infinity : fn.params.length };
-    }
-
-    /**
-     * Reads the code's structure without running it: which functions exist (including functions
-     * inside object literals, listed as "service.greet"), which classes have which methods, and
-     * who calls whom. Assumes the code already passed the syntax check.
-     */
-    function analyzeStructure(code, sourceType) {
-      const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType, locations: true });
-      const structure = {
-        functions: new Map(),        // name or "service.greet" -> { min, max } arguments accepted
-        functionCount: new Map(),    // how many times each name was defined; a name defined twice is ambiguous
-        calls: [],                   // direct calls to plain names
-        methodCalls: [],             // this.method() calls
-        memberCalls: [],             // obj.method() calls where obj is a plain name
-        superCalls: [],              // super.method() calls
-        newCalls: [],                // new X() calls
-        otherCalls: [],              // calls that can only be traced by guessing
-        classes: new Map(),          // class name -> { name, members, hasParent, parentName }
-        aliases: new Map(),          // alias -> { kind: "name", target } or { kind: "member", object, method }
-        shorthandTargets: new Map(), // "obj.method" written as shorthand { method } -> the outer function name
-        objectMembers: new Map(),    // object literal name -> Set of member names it has
-        declared: new Set(),         // every name this code declares itself
-        nameCounts: new Map(),       // how often each name appears anywhere in the code
-        exported: new Set(),         // names exported from a module
-        callOwners: new Set(),       // owners whose body contains at least one call of any kind
-      };
-      const owners = [];         // functions we are currently inside
-      const classes = [];        // classes we are currently inside
-      const objects = [];        // const objects we are currently inside: const service = { ... }
-      const currentClass = () => classes.at(-1);
-      const currentObject = () => objects.at(-1);
-      const currentOwner = () => owners.at(-1) ?? "(top level)";
-      const whereOf = (node) => ({ line: node.loc.start.line, column: node.loc.start.column + 1, owner: currentOwner() });
-
-      /** The name a function-like node goes by in the call map, or null if it is not a named function. */
-      function ownerOf(node) {
-        if (node.type === "FunctionDeclaration") return node.id?.name ?? null;
-        if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && isFunction(node.init)) return node.id.name;
-        if (node.type === "MethodDefinition" && !node.computed && node.key.type === "Identifier") {
-          return `${currentClass()?.name}.${node.key.name}`;
-        }
-        return objectMethodName(node);
-      }
-
-      /** "service.greet" for a function written inside const service = { ... }, otherwise null. */
-      function objectMethodName(node) {
-        const isNamedFunction = node.type === "Property" && isFunction(node.value) && !node.computed && node.key.type === "Identifier";
-        return isNamedFunction && currentObject() ? `${currentObject()}.${node.key.name}` : null;
-      }
-
-      /** The name of a const object being created here (const service = { ... }), or null. */
-      function objectNameOf(node) {
-        const isObject = node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init?.type === "ObjectExpression";
-        return isObject ? node.id.name : null;
-      }
-
-      function defineFunction(node) {
-        let name = null;
-        if (node.type === "FunctionDeclaration" && node.id) {
-          name = node.id.name;
-        } else if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && isFunction(node.init)) {
-          name = node.id.name;
-        } else if (objectMethodName(node)) {
-          name = objectMethodName(node);
-        }
-        if (!name) return;
-        // Count definitions: a name defined more than once (two scopes, declaration + assignment)
-        // is ambiguous, and argument checks must not trust the last definition seen. This is the
-        // same guard the Python structure checks apply via single_definition().
-        structure.functionCount.set(name, (structure.functionCount.get(name) ?? 0) + 1);
-        const fn = node.init ?? node.value ?? node;
-        structure.functions.set(name, argumentRange(fn));
-      }
-
-      /** Remembers the members of object literals, including shorthand { greet } -> outer function greet. */
-      function noteObjectMember(node) {
-        if (node.type !== "Property" || node.computed || node.key.type !== "Identifier" || !currentObject()) return;
-        const object = currentObject();
-        if (!structure.objectMembers.has(object)) structure.objectMembers.set(object, new Set());
-        structure.objectMembers.get(object).add(node.key.name);
-        if (node.shorthand && node.value.type === "Identifier") {
-          structure.shorthandTargets.set(`${object}.${node.key.name}`, node.value.name);
         }
       }
 
-      /** Remembers every name the code declares, simple aliases (const fn = greet, const fn = obj.m), ... */
-      function noteDeclarations(node) {
-        const declare = (pattern) => {
-          if (!pattern) return;
-          if (pattern.type === "Identifier") structure.declared.add(pattern.name);
-          else if (pattern.type === "AssignmentPattern") declare(pattern.left);
-          else if (pattern.type === "RestElement") declare(pattern.argument);
-          else if (pattern.type === "ArrayPattern") pattern.elements.forEach(declare);
-          else if (pattern.type === "ObjectPattern") pattern.properties.forEach((property) => declare(property.value ?? property.argument));
-        };
-
-        if (node.type === "VariableDeclarator") declare(node.id);
-        else if (node.type === "CatchClause") declare(node.param);
-        else if (node.type.startsWith("Import") && node.local) structure.declared.add(node.local.name);
-        else if (isFunction(node)) {
-          declare(node.id);
-          node.params.forEach(declare);
-        }
-        if (node.type === "VariableDeclaration" && node.kind === "const") {   // const can never be reassigned, so the alias is safe to follow
-          for (const declarator of node.declarations) {
-            if (declarator.id.type !== "Identifier" || !declarator.init) continue;
-            if (declarator.init.type === "Identifier") {
-              structure.aliases.set(declarator.id.name, { kind: "name", target: declarator.init.name });
-            } else if (declarator.init.type === "MemberExpression" && declarator.init.object.type === "Identifier"
-                && !declarator.init.computed && declarator.init.property.type === "Identifier") {
-              structure.aliases.set(declarator.id.name, {
-                kind: "member", object: declarator.init.object.name, method: declarator.init.property.name,
+      // Check loop counter shadowing in nested for loops
+      if (node.type === "ForStatement" && node.init && node.init.type === "VariableDeclaration") {
+        for (const decl of node.init.declarations) {
+          if (decl.id.type === "Identifier") {
+            const varName = decl.id.name;
+            if (loopVars.includes(varName)) {
+              structure.loopShadowing.push({
+                ...whereOf(node),
+                name: varName,
               });
             }
+            loopVars.push(varName);
           }
         }
       }
 
-      function rememberThisAssignment({ left }) {
-        const isThisProperty = left.type === "MemberExpression" && left.object.type === "ThisExpression"
-          && !left.computed && left.property.type === "Identifier";
-        if (isThisProperty) currentClass()?.members.add(left.property.name);
-      }
-
-      function recordCall(node) {
-        const { callee } = node;
-        const where = whereOf(node);
-        structure.callOwners.add(where.owner);
-
-        for (const argument of node.arguments) {           // a function handed to another call will be called by it
-          if (argument.type === "Identifier") structure.otherCalls.push({ ...where, kind: "passed", name: argument.name });
-        }
-
-        if (callee.type === "Identifier") {
-          const hasSpread = node.arguments.some((argument) => argument.type === "SpreadElement");
-          structure.calls.push({ ...where, name: callee.name, argCount: node.arguments.length, hasSpread });
-        } else if (callee.type === "MemberExpression") {
-          recordMemberCall(callee, where, node);
+      noteDeclarations(node);
+      defineFunction(node);
+      noteObjectMember(node);
+      const objectName = objectNameOf(node);
+      if (objectName) objects.push(objectName);
+      const owner = ownerOf(node);
+      if (owner) owners.push(owner);
+    },
+    leave(node) {
+      if (node.type === "ForStatement" && node.init?.type === "VariableDeclaration") {
+        for (const decl of node.init.declarations) {
+          if (decl.id.type === "Identifier") loopVars.pop();
         }
       }
+      if (ownerOf(node)) owners.pop();
+      if (objectNameOf(node)) objects.pop();
+      if (isClass(node)) classes.pop();
+    },
+  });
 
-      function recordMemberCall(callee, where, node) {
-        const method = !callee.computed && callee.property.type === "Identifier" ? callee.property.name : null;
-        const argCount = node.arguments.length;
-        const hasSpread = node.arguments.some((argument) => argument.type === "SpreadElement");
+  return structure;
+}
 
-        if (callee.object.type === "ThisExpression" && method && currentClass()) {
-          structure.methodCalls.push({ ...where, cls: currentClass(), method, argCount, hasSpread });
-        } else if (callee.object.type === "Super" && method && currentClass()) {
-          structure.superCalls.push({ ...where, cls: currentClass(), method, argCount, hasSpread });
-        } else if (callee.object.type === "Identifier" && method) {
-          structure.memberCalls.push({ ...where, object: callee.object.name, method, argCount, hasSpread });
-        } else {
-          structure.otherCalls.push({ ...where, kind: "dynamic", text: method ? `….${method}()` : "[…]()" });
-        }
-      }
+/** "1 argument" / "2 arguments" — shared wording for the argument-count findings. */
+function countLabel(count, noun) {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
 
-      function recordExports({ declaration, specifiers = [] }) {
-        const names = [
-          declaration?.id?.name,
-          declaration?.name,
-          ...(declaration?.declarations ?? []).map((declarator) => declarator.id.name),
-          ...specifiers.map((specifier) => specifier.local.name),
-        ];
-        names.filter(Boolean).forEach((name) => structure.exported.add(name));
-      }
+function structureFinding(call, message, ruleId, severity) {
+  return { line: call.line, column: call.column, message, ruleId, severity };
+}
 
-      walkTree(ast, {
-        enter(node) {
-          if (node.type === "Identifier") {
-            structure.nameCounts.set(node.name, (structure.nameCounts.get(node.name) ?? 0) + 1);
-          } else if (isClass(node)) {
-            const info = {
-              name: node.id?.name ?? "(anonymous class)", members: new Set(), hasParent: Boolean(node.superClass),
-              parentName: node.superClass?.type === "Identifier" ? node.superClass.name : null,
-            };
-            classes.push(info);
-            if (node.id) structure.classes.set(info.name, info);
-          } else if (node.type === "MethodDefinition" || node.type === "PropertyDefinition") {
-            if (!node.computed && node.key.type === "Identifier") currentClass()?.members.add(node.key.name);
-          } else if (node.type === "AssignmentExpression") {
-            rememberThisAssignment(node);
-          } else if (node.type === "CallExpression") {
-            recordCall(node);
-          } else if (node.type === "NewExpression" && node.callee.type === "Identifier") {
-            structure.newCalls.push({ ...whereOf(node), name: node.callee.name });
-            structure.callOwners.add(currentOwner());
-          } else if (node.type === "ExportNamedDeclaration" || node.type === "ExportDefaultDeclaration") {
-            recordExports(node);
-          }
+function resolveAliasTarget(aliases, name) {
+  const alias = aliases.get(name);
+  if (!alias) return null;
+  return alias.kind === "name" ? alias.target : `${alias.object}.${alias.method}`;
+}
 
-          noteDeclarations(node);
-          defineFunction(node);
-          noteObjectMember(node);
-          const objectName = objectNameOf(node);
-          if (objectName) objects.push(objectName);
-          const owner = ownerOf(node);
-          if (owner) owners.push(owner);
-        },
-        leave(node) {
-          if (ownerOf(node)) owners.pop();
-          if (objectNameOf(node)) objects.pop();
-          if (isClass(node)) classes.pop();
-        },
-      });
+/**
+ * Suspicious calls found without running anything.
+ */
+function findStructureProblems({
+  functions,
+  functionCount,
+  calls,
+  memberCalls,
+  methodCalls,
+  aliases,
+  shorthandTargets,
+  nameCounts,
+  loopInvariants = [],
+  loopShadowing = [],
+  unawaitedCalls = [],
+}) {
+  const errors = [];
+  const notes = [];
+  const usesArguments = nameCounts.has("arguments");
 
-      return structure;
+  for (const call of calls) {
+    const aliased = resolveAliasTarget(aliases, call.name);
+    const known = functions.get(call.name) ?? (aliased ? functions.get(aliased) : undefined);
+    const ambiguous = (functionCount.get(call.name) ?? 1) > 1
+      || (aliased && (functionCount.get(aliased) ?? 1) > 1);
+    if (!known || ambiguous || call.hasSpread || usesArguments) continue;
+    const given = countLabel(call.argCount, "argument");
+    const label = aliased ? `${call.name}() (alias for ${aliased}())` : `${call.name}()`;
+
+    if (call.argCount > known.max) {
+      errors.push(structureFinding(call, `${label} is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
+    } else if (call.argCount < known.min) {
+      notes.push(structureFinding(call, `${label} is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
     }
+  }
 
-    /** "1 argument" / "2 arguments" — shared wording for the argument-count findings. */
-    function countLabel(count, noun) {
-      return `${count} ${noun}${count === 1 ? "" : "s"}`;
+  for (const call of memberCalls) {
+    const key = `${call.object}.${call.method}`;
+    let known = functions.get(key);
+    let label = `${key}()`;
+    if (!known) {
+      const shorthand = shorthandTargets.get(key);
+      if (shorthand && functions.has(shorthand)) {
+        known = functions.get(shorthand);
+        label = `${key}() (shorthand for ${shorthand}())`;
+      }
     }
+    if (!known || (functionCount.get(key) ?? 1) > 1 || call.hasSpread || usesArguments) continue;
+    const given = countLabel(call.argCount, "argument");
 
-    function structureFinding(call, message, ruleId, severity) {
-      return { line: call.line, column: call.column, message, ruleId, severity };
+    if (call.argCount > known.max) {
+      errors.push(structureFinding(call, `${label} is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
+    } else if (call.argCount < known.min) {
+      notes.push(structureFinding(call, `${label} is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
     }
+  }
 
-    /** What a one-step alias (const fn = greet / const fn = obj.method) ultimately names, or null. */
-    function resolveAliasTarget(aliases, name) {
-      const alias = aliases.get(name);
-      if (!alias) return null;
-      return alias.kind === "name" ? alias.target : `${alias.object}.${alias.method}`;
+  for (const call of methodCalls) {
+    if (call.cls.hasParent || call.cls.members.has(call.method)) continue;
+    errors.push(structureFinding(call, `this.${call.method}() is called, but ${call.cls.name} has no method or property "${call.method}"`, "zapple/unknown-method", "error"));
+  }
+
+  for (const loop of loopInvariants) {
+    errors.push(structureFinding(
+      loop,
+      `While loop condition depends on "${loop.vars.join(', ')}", but none of these variables are modified in the loop body (likely infinite loop)`,
+      "zapple/unmodified-loop-condition",
+      "error"
+    ));
+  }
+
+  for (const item of loopShadowing) {
+    notes.push(structureFinding(
+      item,
+      `Loop variable "${item.name}" shadows an outer loop variable with the same name. This can cause early termination or skipped iterations.`,
+      "zapple/loop-variable-shadowing",
+      "note"
+    ));
+  }
+
+  for (const item of unawaitedCalls) {
+    errors.push(structureFinding(
+      item,
+      `"${item.name}()" is an async function that returns a Promise. Accessing ".${item.property}" without "await" will read from the Promise object, resulting in undefined.`,
+      "zapple/unawaited-async",
+      "error"
+    ));
+  }
+
+  return { errors, notes };
+}
+
+const BUILT_IN_METHODS = new Set(
+  [Array, String, Object, Map, Set, Promise, Function, Number, Date, RegExp]
+    .flatMap((type) => Object.getOwnPropertyNames(type.prototype))
+);
+
+const NOT_FOLLOWED_WHY = {
+  variable: "called through a variable that is not a function declared here",
+  member: "called through an object, and Zapple could not tell which function that is",
+  dynamic: "called through an expression Zapple cannot read",
+  super: "the parent class is not in this code",
+};
+
+function buildCallMap(structure) {
+  const { functions, calls, methodCalls, memberCalls, superCalls, newCalls, otherCalls, classes, aliases,
+    shorthandTargets, declared, nameCounts, exported, callOwners } = structure;
+  const byOwner = new Map();
+  const entryFor = (owner) => {
+    if (!byOwner.has(owner)) byOwner.set(owner, { followed: new Set(), guessed: new Set(), builtIn: new Set(), notFollowed: [] });
+    return byOwner.get(owner);
+  };
+  const notFollowed = (call, text, why) => entryFor(call.owner).notFollowed.push({ text, why: NOT_FOLLOWED_WHY[why], line: call.line });
+
+  const onlyClassWith = (method) => {
+    const owners = [...classes.values()].filter((info) => info.members.has(method));
+    return owners.length === 1 ? owners[0].name : null;
+  };
+
+  for (const call of calls) {
+    const aliased = resolveAliasTarget(aliases, call.name);
+    if (functions.has(call.name)) entryFor(call.owner).followed.add(call.name);
+    else if (aliased && functions.has(aliased)) entryFor(call.owner).followed.add(`${aliased} (through ${call.name})`);
+    else if (declared.has(call.name)) notFollowed(call, `${call.name}()`, "variable");
+    else entryFor(call.owner).builtIn.add(`${call.name}()`);
+  }
+
+  for (const call of methodCalls) entryFor(call.owner).followed.add(`this.${call.method}`);
+
+  for (const call of memberCalls) {
+    const key = `${call.object}.${call.method}`;
+    const entry = entryFor(call.owner);
+    const shorthand = shorthandTargets.get(key);
+    if (functions.has(key)) entry.followed.add(key);
+    else if (shorthand && functions.has(shorthand)) entry.guessed.add(`${shorthand}? (through ${key})`);
+    else if (!declared.has(call.object) || BUILT_IN_METHODS.has(call.method)) entry.builtIn.add(`${key}()`);
+    else {
+      const guess = onlyClassWith(call.method);
+      if (guess) entry.guessed.add(`${guess}.${call.method}?`);
+      else notFollowed(call, `${key}()`, "member");
     }
+  }
 
-    /**
-     * Suspicious calls found without running anything.
-     * Too many arguments and unknown this.methods / obj.methods are errors; too few arguments is only a note,
-     * because leaving an argument out is sometimes intentional. Best-guess links never produce argument errors.
-     */
-    function findStructureProblems({ functions, functionCount, calls, memberCalls, methodCalls, aliases, shorthandTargets, nameCounts }) {
-      const errors = [];
-      const notes = [];
-      const usesArguments = nameCounts.has("arguments");   // such code can accept any number of arguments
+  for (const call of superCalls) {
+    const parent = classes.get(call.cls.parentName);
+    if (parent?.members.has(call.method)) entryFor(call.owner).followed.add(`${parent.name}.${call.method}`);
+    else notFollowed(call, `super.${call.method}()`, "super");
+  }
 
-      for (const call of calls) {
-        const aliased = resolveAliasTarget(aliases, call.name);
-        const known = functions.get(call.name) ?? (aliased ? functions.get(aliased) : undefined);
-        // A name defined more than once may not be the function this call reaches.
-        const ambiguous = (functionCount.get(call.name) ?? 1) > 1
-          || (aliased && (functionCount.get(aliased) ?? 1) > 1);
-        if (!known || ambiguous || call.hasSpread || usesArguments) continue;
-        const given = countLabel(call.argCount, "argument");
-        const label = aliased ? `${call.name}() (alias for ${aliased}())` : `${call.name}()`;
+  for (const call of newCalls) {
+    const entry = entryFor(call.owner);
+    if (classes.has(call.name) || functions.has(call.name)) entry.followed.add(`new ${call.name}`);
+    else if (!declared.has(call.name)) entry.builtIn.add(`new ${call.name}`);
+  }
 
-        if (call.argCount > known.max) {
-          errors.push(structureFinding(call, `${label} is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
-        } else if (call.argCount < known.min) {
-          notes.push(structureFinding(call, `${label} is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
-        }
-      }
-
-      for (const call of memberCalls) {
-        const key = `${call.object}.${call.method}`;
-        let known = functions.get(key);
-        let label = `${key}()`;
-        if (!known) {                       // shorthand { greet } calls the outer function greet
-          const shorthand = shorthandTargets.get(key);
-          if (shorthand && functions.has(shorthand)) {
-            known = functions.get(shorthand);
-            label = `${key}() (shorthand for ${shorthand}())`;
-          }
-        }
-        if (!known || (functionCount.get(key) ?? 1) > 1 || call.hasSpread || usesArguments) continue;
-        const given = countLabel(call.argCount, "argument");
-
-        if (call.argCount > known.max) {
-          errors.push(structureFinding(call, `${label} is called with ${given} but accepts only ${known.max}`, "zapple/too-many-arguments", "error"));
-        } else if (call.argCount < known.min) {
-          notes.push(structureFinding(call, `${label} is called with ${given} but expects at least ${known.min}`, "zapple/too-few-arguments", "note"));
-        }
-      }
-
-      for (const call of methodCalls) {
-        if (call.cls.hasParent || call.cls.members.has(call.method)) continue;   // inherited members are unknown to us
-        errors.push(structureFinding(call, `this.${call.method}() is called, but ${call.cls.name} has no method or property "${call.method}"`, "zapple/unknown-method", "error"));
-      }
-
-      return { errors, notes };
+  for (const call of otherCalls) {
+    const entry = entryFor(call.owner);
+    if (call.kind === "passed") {
+      if (functions.has(call.name)) entry.followed.add(`${call.name} (passed along)`);
+    } else {
+      notFollowed(call, call.text, "dynamic");
     }
+  }
 
-    // Method names that belong to built-in types (push, map, then, ...). A call to one of these is never guessed to be ours.
-    const BUILT_IN_METHODS = new Set(
-      [Array, String, Object, Map, Set, Promise, Function, Number, Date, RegExp]
-        .flatMap((type) => Object.getOwnPropertyNames(type.prototype))
-    );
+  const usedShortNames = new Set();
+  for (const call of calls) usedShortNames.add(call.name);
+  for (const call of memberCalls) { usedShortNames.add(call.method); usedShortNames.add(call.object); }
+  for (const call of methodCalls) usedShortNames.add(call.method);
+  for (const call of superCalls) usedShortNames.add(call.method);
+  for (const call of newCalls) usedShortNames.add(call.name);
+  for (const alias of aliases.values()) {
+    if (alias.kind === "name") usedShortNames.add(alias.target);
+    else { usedShortNames.add(alias.object); usedShortNames.add(alias.method); }
+  }
 
-    const NOT_FOLLOWED_WHY = {
-      variable: "called through a variable that is not a function declared here",
-      member: "called through an object, and Zapple could not tell which function that is",
-      dynamic: "called through an expression Zapple cannot read",
-      super: "the parent class is not in this code",
-    };
-
-    /**
-     * Sorts every call Zapple saw into: followed (target known), guessed (one likely target),
-     * built-in or library (not part of this code), or not followed (target unknown).
-     * Returns the call map as text, plus counts for the Insight layer.
-     */
-    function buildCallMap(structure) {
-      const { functions, calls, methodCalls, memberCalls, superCalls, newCalls, otherCalls, classes, aliases,
-        shorthandTargets, declared, nameCounts, exported, callOwners } = structure;
-      const byOwner = new Map();
-      const entryFor = (owner) => {
-        if (!byOwner.has(owner)) byOwner.set(owner, { followed: new Set(), guessed: new Set(), builtIn: new Set(), notFollowed: [] });
-        return byOwner.get(owner);
-      };
-      const notFollowed = (call, text, why) => entryFor(call.owner).notFollowed.push({ text, why: NOT_FOLLOWED_WHY[why], line: call.line });
-
-      /** The one class that has a method with this name, or null when there are none or several. */
-      const onlyClassWith = (method) => {
-        const owners = [...classes.values()].filter((info) => info.members.has(method));
-        return owners.length === 1 ? owners[0].name : null;
-      };
-
-      for (const call of calls) {
-        const aliased = resolveAliasTarget(aliases, call.name);
-        if (functions.has(call.name)) entryFor(call.owner).followed.add(call.name);
-        else if (aliased && functions.has(aliased)) entryFor(call.owner).followed.add(`${aliased} (through ${call.name})`);
-        else if (declared.has(call.name)) notFollowed(call, `${call.name}()`, "variable");
-        else entryFor(call.owner).builtIn.add(`${call.name}()`);
-      }
-
-      for (const call of methodCalls) entryFor(call.owner).followed.add(`this.${call.method}`);
-
-      for (const call of memberCalls) {
-        const key = `${call.object}.${call.method}`;
-        const entry = entryFor(call.owner);
-        const shorthand = shorthandTargets.get(key);
-        if (functions.has(key)) entry.followed.add(key);
-        else if (shorthand && functions.has(shorthand)) entry.guessed.add(`${shorthand}? (through ${key})`);
-        else if (!declared.has(call.object) || BUILT_IN_METHODS.has(call.method)) entry.builtIn.add(`${key}()`);
-        else {
-          const guess = onlyClassWith(call.method);
-          if (guess) entry.guessed.add(`${guess}.${call.method}?`);
-          else notFollowed(call, `${key}()`, "member");
-        }
-      }
-
-      for (const call of superCalls) {
-        const parent = classes.get(call.cls.parentName);
-        if (parent?.members.has(call.method)) entryFor(call.owner).followed.add(`${parent.name}.${call.method}`);
-        else notFollowed(call, `super.${call.method}()`, "super");
-      }
-
-      for (const call of newCalls) {
-        const entry = entryFor(call.owner);
-        if (classes.has(call.name) || functions.has(call.name)) entry.followed.add(`new ${call.name}`);
-        else if (!declared.has(call.name)) entry.builtIn.add(`new ${call.name}`);
-      }
-
-      for (const call of otherCalls) {
-        const entry = entryFor(call.owner);
-        if (call.kind === "passed") {
-          if (functions.has(call.name)) entry.followed.add(`${call.name} (passed along)`);
-        } else {
-          notFollowed(call, call.text, "dynamic");
-        }
-      }
-
-      // Names that count as "used": call targets, member names, alias targets, constructors
-      const usedShortNames = new Set();
-      for (const call of calls) usedShortNames.add(call.name);
-      for (const call of memberCalls) { usedShortNames.add(call.method); usedShortNames.add(call.object); }
-      for (const call of methodCalls) usedShortNames.add(call.method);
-      for (const call of superCalls) usedShortNames.add(call.method);
-      for (const call of newCalls) usedShortNames.add(call.name);
-      for (const alias of aliases.values()) {
-        if (alias.kind === "name") usedShortNames.add(alias.target);
-        else { usedShortNames.add(alias.object); usedShortNames.add(alias.method); }
-      }
-
-      const lines = [];
-      for (const [owner, entry] of byOwner) {
-        const targets = [...entry.followed, ...entry.guessed];
-        if (targets.length > 0) {
-          lines.push(`${owner} → ${targets.join(", ")}`);
-        } else {
-          // Grounded wording: say "no calls here" only when the body truly contains no calls at all
-          const madeCalls = callOwners.has(owner) || entry.notFollowed.length > 0 || entry.builtIn.size > 0;
-          lines.push(madeCalls ? `${owner} (no calls Zapple could identify)` : `${owner} (no calls here)`);
-        }
-        for (const item of entry.notFollowed) lines.push(`    ? ${item.text}  not followed, ${item.why} (line ${item.line})`);
-        if (entry.builtIn.size > 0) lines.push(`    · built-in or library: ${[...entry.builtIn].join(", ")}`);
-      }
-      for (const name of functions.keys()) {
-        if (byOwner.has(name)) continue;
-        lines.push(callOwners.has(name) ? `${name} (no calls Zapple could identify)` : `${name} (no calls here)`);
-      }
-
-      // A function is "used" when its short name appears anywhere else in the code (or via aliases / member calls)
-      const unused = [...functions.keys()].filter((name) => {
-        const short = name.split(".").pop();
-        return (nameCounts.get(short) ?? 0) <= 1 && !usedShortNames.has(short) && !exported.has(name);
-      });
-
-      const sum = (key) => [...byOwner.values()].reduce((total, entry) => total + (entry[key].size ?? entry[key].length), 0);
-      const notFollowedList = [...byOwner.values()].flatMap((entry) => entry.notFollowed);
-      const stats = {
-        functions: functions.size, followed: sum("followed"), guessed: sum("guessed"),
-        notFollowed: notFollowedList.length, builtIn: sum("builtIn"), never: unused.length,
-        notFollowedSamples: notFollowedList.slice(0, 3).map((item) => item.text),
-      };
-
-      if (unused.length > 0) lines.push("", `Never called or referenced: ${unused.join(", ")}`);
-      if (stats.guessed > 0) {
-        lines.push("", "A name ending in ? is a suggested link: only one place in this code has that name, so Zapple shows that link, but reading the code cannot prove the call goes there.");
-      }
-      if (stats.notFollowed > 0) {
-        lines.push("", "Some calls could not be traced by reading the code. A ? at the start of a line marks such a call. "
-          + "Zapple follows only direct calls, this.method(), known object methods and one-step aliases (const fn = greet). "
-          + "Every other call is listed under the calling function as not traced.");
-      }
-
-      return { text: lines.join("\n"), stats };
+  const lines = [];
+  for (const [owner, entry] of byOwner) {
+    const targets = [...entry.followed, ...entry.guessed];
+    if (targets.length > 0) {
+      lines.push(`${owner} → ${targets.join(", ")}`);
+    } else {
+      const madeCalls = callOwners.has(owner) || entry.notFollowed.length > 0 || entry.builtIn.size > 0;
+      lines.push(madeCalls ? `${owner} (no calls Zapple could identify)` : `${owner} (no calls here)`);
     }
+    for (const item of entry.notFollowed) lines.push(`    ? ${item.text}  not followed, ${item.why} (line ${item.line})`);
+    if (entry.builtIn.size > 0) lines.push(`    · built-in or library: ${[...entry.builtIn].join(", ")}`);
+  }
+  for (const name of functions.keys()) {
+    if (byOwner.has(name)) continue;
+    lines.push(callOwners.has(name) ? `${name} (no calls Zapple could identify)` : `${name} (no calls here)`);
+  }
 
-    // ---------- Python engine (no DOM code here) ----------
+  const unused = [...functions.keys()].filter((name) => {
+    const short = name.split(".").pop();
+    return (nameCounts.get(short) ?? 0) <= 1 && !usedShortNames.has(short) && !exported.has(name);
+  });
 
-    // Python runs through Pyodide: Python compiled to work inside the browser.
-    // It loads only when Python is chosen (about 10 MB the first time, cached afterwards).
-    const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
-    const PYTHON_LOAD_TIMEOUT_MS = 90000;
+  const sum = (key) => [...byOwner.values()].reduce((total, entry) => total + (entry[key].size ?? entry[key].length), 0);
+  const notFollowedList = [...byOwner.values()].flatMap((entry) => entry.notFollowed);
+  const stats = {
+    functions: functions.size, followed: sum("followed"), guessed: sum("guessed"),
+    notFollowed: notFollowedList.length, builtIn: sum("builtIn"), never: unused.length,
+    notFollowedSamples: notFollowedList.slice(0, 3).map((item) => item.text),
+  };
 
-    const PYTHON_SKIP_TIP = "The syntax, undefined-name and structure checks above still apply to this code. Running it for real needs a fuller Python than a browser can offer (extra packages, threads), which is what the planned remote runner is for.";
+  if (unused.length > 0) lines.push("", `Never called or referenced: ${unused.join(", ")}`);
+  if (stats.guessed > 0) {
+    lines.push("", "A name ending in ? is a suggested link: only one place in this code has that name, so Zapple shows that link, but reading the code cannot prove the call goes there.");
+  }
+  if (stats.notFollowed > 0) {
+    lines.push("", "Some calls could not be traced by reading the code. A ? at the start of a line marks such a call. "
+      + "Zapple follows only direct calls, this.method(), known object methods and one-step aliases (const fn = greet). "
+      + "Every other call is listed under the calling function as not traced.");
+  }
 
-    // The Python that does the actual checking. It runs inside the worker and returns one result per check.
-    const PYTHON_SOURCE = String.raw`
+  return { text: lines.join("\n"), stats };
+}
+
+// ---------- Python engine (no DOM code here) ----------
+
+const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+const PYTHON_LOAD_TIMEOUT_MS = 90000;
+
+const PYTHON_SKIP_TIP = "The syntax, undefined-name and structure checks above still apply to this code. Running it for real needs a fuller Python than a browser can offer (extra packages, threads), which is what the planned remote runner is for.";
+
+const PYTHON_SOURCE = String.raw`
 import ast, builtins, contextlib, copy, inspect, io, json, re, sys, time, traceback
 from pyflakes.checker import Checker
 
-# pyflakes finding types that mean the code is wrong. Every other type is only a note.
 ERROR_KINDS = {"UndefinedName", "UndefinedLocal", "UndefinedExport", "DuplicateArgument",
                "ReturnOutsideFunction", "YieldOutsideFunction"}
 MAX_OUTPUT_LINES = 200
@@ -840,12 +1009,9 @@ def finding(message, line=None, column=None, rule="", severity="error"):
     return {"line": line, "column": column, "message": message, "ruleId": rule, "severity": severity}
 
 def blank_notebook_lines(code):
-    """Colab lines such as '!pip install x' or '%matplotlib inline' are not Python.
-    Swap them for 'pass' so line numbers stay the same. Returns (new code, lines swapped)."""
     return re.subn(r"(?m)^([ \t]*)[!%].*$", r"\1pass", code)
 
 def outside_packages(tree):
-    """Imported packages that are not part of standard Python."""
     names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -868,16 +1034,14 @@ def crash_finding(error):
     line = None
     for frame in traceback.extract_tb(error.__traceback__):
         if frame.filename == "<user code>":
-            line = frame.lineno          # keeps the deepest line that belongs to the user's code
+            line = frame.lineno
     if line is None:
         line = getattr(error, "lineno", None)
     return finding(f"{type(error).__name__}: {error}", line, None, "runtime")
 
 class AsyncRunRewriter(ast.NodeTransformer):
-    """Zapple's Python already has an event loop running, so asyncio.run(x) cannot start a second one.
-    Outside functions, asyncio.run(x) is swapped for 'await x', which does the same job here."""
     def visit_FunctionDef(self, node):
-        return node                       # 'await' is only allowed outside functions, so leave functions alone
+        return node
     visit_AsyncFunctionDef = visit_Lambda = visit_ClassDef = visit_FunctionDef
 
     def visit_Call(self, node):
@@ -890,7 +1054,6 @@ class AsyncRunRewriter(ast.NodeTransformer):
         return node
 
 def environment_limit(error, outside):
-    """Why a crash comes from Zapple's browser-based Python rather than from the user's code, or None."""
     if isinstance(error, ModuleNotFoundError) and (error.name or "").split(".")[0] in outside:
         return (f"it imports {error.name}, which is not part of standard Python. "
                 "Zapple's Python runs inside your browser and only has the standard library for now.")
@@ -900,7 +1063,6 @@ def environment_limit(error, outside):
     return None
 
 async def run_code(tree):
-    """Runs the code. Returns (variables it created, lines it printed, the error it raised or None)."""
     namespace = {"__name__": "__main__"}
     printed = io.StringIO()
     crash = None
@@ -909,7 +1071,7 @@ async def run_code(tree):
         compiled = compile(rewritten, "<user code>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
             outcome = eval(compiled, namespace)
-            if inspect.iscoroutine(outcome):      # the code used 'await' (or asyncio.run) at the top level
+            if inspect.iscoroutine(outcome):
                 await outcome
     except SystemExit:
         pass
@@ -918,7 +1080,6 @@ async def run_code(tree):
     return namespace, printed.getvalue().splitlines()[:MAX_OUTPUT_LINES], crash
 
 def run_checks(check_lines, namespace):
-    """Evaluates the user's checks, one expression per line. Returns (findings, number of valid checks)."""
     findings, total = [], 0
     for source in check_lines:
         try:
@@ -941,22 +1102,14 @@ def run_checks(check_lines, namespace):
             findings.append(finding(f"Check failed{detail}: {source}", rule="check"))
     return findings, total
 
-# ---------- Structure checks and call map ----------
-# Reads the code's shape without running it. Only names that are defined exactly once, and never reused
-# as a variable or parameter, are checked. That gives up a few real catches to avoid false alarms.
-
 FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 SCOPE_NODES = FUNCTION_NODES + (ast.Lambda,)
 OBJECT_BASES = {"object"}
 
-# Method names Python itself calls (the import system), so a class defining them is not "never called"
 IMPORT_HOOKS = {"find_spec", "find_module", "create_module", "exec_module", "load_module"}
-
-# Method names of built-in types; a call to one of these is not guessed to belong to a user class
 COMMON_METHODS = set(dir(list)) | set(dir(dict)) | set(dir(str)) | set(dir(set)) | set(dir(bytes))
 
 def mutable_default_notes(tree):
-    """A list, dict or set written as a default value is created once and shared by every call."""
     notes = []
     for node in ast.walk(tree):
         if not isinstance(node, SCOPE_NODES):
@@ -984,32 +1137,29 @@ def names_in(items):
     return ", ".join(f'"{item}"' for item in items)
 
 class ClassInfo:
-    """What one class definition offers: its methods, its attributes, and whether we can trust that list."""
     def __init__(self, node):
         self.node = node
         self.name = node.name
-        self.methods = {}          # method name -> [definitions]
-        self.members = set()       # every name an instance may have
+        self.methods = {}
+        self.members = set()
         self.decorated = bool(node.decorator_list)
         has_base = any(not (isinstance(b, ast.Name) and b.id in OBJECT_BASES) for b in node.bases)
-        self.has_parent = has_base or bool(node.keywords)   # inherited members cannot be seen from this file
-        self.dynamic = False       # the class adds names at run time (setattr, __getattr__, __dict__)
-        self.set_on_self = set()   # attributes assigned through self.name = ...
+        self.has_parent = has_base or bool(node.keywords)
+        self.dynamic = False
+        self.set_on_self = set()
 
 class Structure:
-    """Everything the structure checks need, collected in one walk over the syntax tree."""
     def __init__(self, tree):
-        self.plain_defs = {}       # name -> [(definition, enclosing function or None)]
-        self.rebound = set()       # names used as variables, parameters, imports and so on
-        self.classes = {}          # ClassDef node -> ClassInfo
-        self.referenced = set()    # names and attributes that are read somewhere
+        self.plain_defs = {}
+        self.rebound = set()
+        self.classes = {}
+        self.referenced = set()
         self.uses_dynamic_lookup = False
         self._collect(tree, None)
         self.imported = {(alias.asname or alias.name).split(".")[0] for node in ast.walk(tree)
                          if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names}
 
     def _collect(self, node, scope, class_node=None):
-        """Walks the tree. class_node is set only for the direct children of a class body."""
         if isinstance(node, FUNCTION_NODES + (ast.ClassDef,)):
             if class_node is None:
                 self.plain_defs.setdefault(node.name, []).append((node, scope))
@@ -1053,7 +1203,6 @@ class Structure:
             self.rebound.add(node.rest)
 
     def _note_class_body(self, node, info):
-        """Records the names a class defines directly and the attributes its methods assign on self."""
         for statement in node.body:
             if isinstance(statement, FUNCTION_NODES + (ast.ClassDef,)):
                 info.members.add(statement.name)
@@ -1075,14 +1224,12 @@ class Structure:
             info.dynamic = True
 
     def single_definition(self, name):
-        """The one function or class this name means, or None when the name is ambiguous."""
         found = self.plain_defs.get(name, [])
         if len(found) != 1 or name in self.rebound:
             return None
         return found[0]
 
 def build_signature(fn, drop_first):
-    """What a function accepts, in a form that is easy to compare with a call. None if it cannot be judged."""
     args = fn.args
     positional = args.posonlyargs + args.args
     required_count = len(positional) - len(args.defaults)
@@ -1105,7 +1252,6 @@ def build_signature(fn, drop_first):
     }
 
 def call_problems(call, signature, label):
-    """Messages describing every way this call does not fit the signature. Calls using * or ** are not judged."""
     if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
         return []
     problems = []
@@ -1133,14 +1279,13 @@ def call_problems(call, signature, label):
     return problems
 
 def constructor_signature(info):
-    """What calling the class itself accepts, or None when we cannot tell."""
     if info.decorated or info.has_parent:
         return None
     customized = [n for n in ("__new__", "__init_subclass__") if n in info.members]
     if customized or "__call__" in info.methods:
         return None
     if "__init__" not in info.members:
-        return build_signature(ast.parse("def __init__(self): pass").body[0], True)   # accepts nothing
+        return build_signature(ast.parse("def __init__(self): pass").body[0], True)
     definitions = info.methods.get("__init__", [])
     if len(definitions) != 1 or definitions[0].decorator_list:
         return None
@@ -1151,16 +1296,15 @@ def finding_for(call, problem):
     return finding(message, call.lineno, call.col_offset + 1, "zapple/" + rule)
 
 class CallWalker:
-    """Visits every call with its surroundings: the enclosing function, class and function scopes."""
     def __init__(self, structure):
         self.structure = structure
         self.errors = []
-        self.callees = {}          # owner -> ordered callees, for the call map
-        self.not_followed = {}     # owner -> [(text, why, line)] calls whose target Zapple could not tell
-        self.built_in = {}         # owner -> built-in or library calls, which are not part of this code
+        self.callees = {}
+        self.not_followed = {}
+        self.built_in = {}
         self.plain_called = set()
-        self.any_calls = set()          # owners whose body contains at least one call of any kind
-        self.method_owners = {}    # method name -> classes that define it (for best-guess links)
+        self.any_calls = set()
+        self.method_owners = {}
         for info in structure.classes.values():
             for name in info.methods:
                 self.method_owners.setdefault(name, []).append(info.name)
@@ -1179,7 +1323,7 @@ class CallWalker:
             if in_class:
                 self_name = None if node.decorator_list else first_param(node)
             elif self_name in {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg)}:
-                self_name = None                     # a parameter hides self inside this function
+                self_name = None
             scopes = scopes + [node]
             for child in ast.iter_child_nodes(node):
                 self.visit(child, owner, cls, self_name, scopes)
@@ -1203,7 +1347,7 @@ class CallWalker:
         self.any_calls.add(owner)
         self.note_functions_passed(call, owner, scopes)
         if isinstance(target, ast.Name):
-            if target.id == "cls" and cls is not None:      # inside a classmethod, cls(...) builds this class
+            if target.id == "cls" and cls is not None:
                 self.add_callee(owner, cls.name)
             self.sort_plain_call(call, target.id, owner, scopes)
             self.check_plain_call(call, target.id, owner, scopes)
@@ -1225,7 +1369,6 @@ class CallWalker:
         self.not_followed.setdefault(owner, []).append((text, why, call.lineno))
 
     def sort_plain_call(self, call, name, owner, scopes):
-        """Calls to names that are not functions defined in this code: built-ins, or calls through a variable."""
         defined = any(scope is None or scope in scopes for _, scope in self.structure.plain_defs.get(name, []))
         if defined or name == "cls":
             return
@@ -1235,7 +1378,6 @@ class CallWalker:
             self.note_not_followed(owner, f"{name}()", "called through a variable that is not a function defined here", call)
 
     def sort_member_call(self, call, target, owner):
-        """obj.method(): a guess when only one class has that method, a built-in, or not followed."""
         method = target.attr
         root = target.value.id if isinstance(target.value, ast.Name) else None
         text = f"{root}.{method}()" if root else f"….{method}()"
@@ -1249,7 +1391,6 @@ class CallWalker:
         return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "super"
 
     def super_target(self, cls, method):
-        """The parent method a super() call most likely reaches, or 'super().method' if the parent is not in this file."""
         for base in cls.node.bases:
             found = self.structure.single_definition(base.id) if isinstance(base, ast.Name) else None
             if found and isinstance(found[0], ast.ClassDef) and method in self.structure.classes[found[0]].methods:
@@ -1257,7 +1398,6 @@ class CallWalker:
         return f"super().{method}"
 
     def note_functions_passed(self, call, owner, scopes):
-        """A function handed to another call (executor.submit(task), map(task, items)) will be called by it."""
         for argument in call.args + [k.value for k in call.keywords]:
             if isinstance(argument, ast.Name):
                 visible = [d for d, scope in self.structure.plain_defs.get(argument.id, [])
@@ -1266,7 +1406,6 @@ class CallWalker:
                     self.add_callee(owner, f"{argument.id} (passed along)")
 
     def note_property_setter(self, target, owner, cls, self_name):
-        """self.x = value runs the class's @x.setter method, when it has one."""
         is_self_attribute = (cls is not None and self_name and isinstance(target, ast.Attribute)
                              and isinstance(target.value, ast.Name) and target.value.id == self_name)
         if not is_self_attribute:
@@ -1277,7 +1416,6 @@ class CallWalker:
                 return
 
     def guess_method_target(self, method, owner):
-        """obj.method(): when only one class defines that method name, that class is probably the target."""
         owners = self.method_owners.get(method, [])
         if len(owners) == 1 and method not in COMMON_METHODS and not is_dunder(method):
             self.add_callee(owner, f"{owners[0]}.{method}?")
@@ -1302,7 +1440,7 @@ class CallWalker:
 
     def check_method_call(self, call, method, cls):
         definitions = cls.methods.get(method, [])
-        replaced = method in cls.set_on_self   # self.method = something would replace the method
+        replaced = method in cls.set_on_self
         if len(definitions) == 1 and not definitions[0].decorator_list and not replaced:
             signature = build_signature(definitions[0], True)
             if signature:
@@ -1314,7 +1452,6 @@ class CallWalker:
             self.errors.append(finding_for(call, ("unknown-method", message)))
 
 def unused_names(structure, check_names):
-    """Functions and methods that nothing in the code (or in the user's checks) refers to."""
     used = structure.referenced | check_names
     unused = []
     for name, found in structure.plain_defs.items():
@@ -1383,7 +1520,6 @@ def check_names_used(check_lines):
     return names
 
 def analyze_structure(tree, check_lines):
-    """Returns (errors, call map text, number of functions and classes found)."""
     structure = Structure(tree)
     walker = CallWalker(structure)
     walker.visit(tree, "(top level)", None, None, [])
@@ -1416,16 +1552,16 @@ async def analyze(request):
     try:
         problems, result["callMap"], result["structureCount"], result["untracedCalls"] = analyze_structure(tree, request["checks"])
         result["errors"] = sorted(result["errors"] + problems, key=lambda f: f["line"] or 0)
-    except Exception as error:            # a bug in the structure checks must never stop the other checks
+    except Exception as error:
         result["structureFailed"] = f"{type(error).__name__}: {error}"
     if result["errors"]:
-        return result                     # broken code is not run; the page explains why
+        return result
 
     outside = outside_packages(tree)
     namespace, result["output"], error = await run_code(tree)
     limit = environment_limit(error, outside) if error else None
     if limit:
-        result["skipReason"], result["output"] = limit, []   # not the code's fault: report "not test-run"
+        result["skipReason"], result["output"] = limit, []
     elif error:
         result["runErrors"] = [crash_finding(error)]
     else:
@@ -1439,399 +1575,369 @@ async def zapple_analyze(request_json):
     return json.dumps(result)
 `;
 
-    /** Runs inside the Python worker (copied in as text): loads Python, then answers "run" requests. */
-    function pythonWorkerMain() {
-      let pyodide = null;
+function pythonWorkerMain() {
+  let pyodide = null;
 
-      self.onmessage = async ({ data }) => {
-        if (data.type === "init") {
-          try {
-            importScripts(`${data.pyodideUrl}pyodide.js`);
-            pyodide = await loadPyodide({ indexURL: data.pyodideUrl });
-            await pyodide.loadPackage("micropip");
-            await pyodide.pyimport("micropip").install("pyflakes");
-            pyodide.runPython(data.pythonSource);
+  self.onmessage = async ({ data }) => {
+    if (data.type === "init") {
+      try {
+        importScripts(`${data.pyodideUrl}pyodide.js`);
+        pyodide = await loadPyodide({ indexURL: data.pyodideUrl });
+        await pyodide.loadPackage("micropip");
+        await pyodide.pyimport("micropip").install("pyflakes");
+        pyodide.runPython(data.pythonSource);
 
-            // Loading is finished, so network and storage can be shut off before any user code runs.
-            // (Python code reaches these through the browser bridge, for example "from js import fetch".)
-            for (const name of data.blockedNames) {
-              Object.defineProperty(self, name, {
-                get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
-              });
-            }
-            self.postMessage({ type: "ready" });
-          } catch (error) {
-            self.postMessage({ type: "failed", message: String(error) });
-          }
-        } else if (data.type === "run") {
-          try {
-            const analyze = pyodide.globals.get("zapple_analyze");
-            const answer = await analyze(JSON.stringify(data.request));
-            self.postMessage({ type: "result", result: JSON.parse(answer) });
-          } catch (error) {
-            self.postMessage({ type: "result", result: { internalError: String(error) } });
-          }
+        for (const name of data.blockedNames) {
+          Object.defineProperty(self, name, {
+            get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
+          });
         }
-      };
+        self.postMessage({ type: "ready" });
+      } catch (error) {
+        self.postMessage({ type: "failed", message: String(error) });
+      }
+    } else if (data.type === "run") {
+      try {
+        const analyze = pyodide.globals.get("zapple_analyze");
+        const answer = await analyze(JSON.stringify(data.request));
+        self.postMessage({ type: "result", result: JSON.parse(answer) });
+      } catch (error) {
+        self.postMessage({ type: "result", result: { internalError: String(error) } });
+      }
     }
+  };
+}
 
-    let pythonWorker = null;   // a promise for the running Python worker; reused between checks
+let pythonWorker = null;
 
-    function startPythonWorker(log) {
-      log.add("Loading Python (about 10 MB the first time, then cached)...");
-      const url = URL.createObjectURL(new Blob([`(${pythonWorkerMain})();`], { type: "text/javascript" }));
-      const worker = new Worker(url);
+function startPythonWorker(log) {
+  log.add("Loading Python (about 10 MB the first time, then cached)...");
+  const url = URL.createObjectURL(new Blob([`(${pythonWorkerMain})();`], { type: "text/javascript" }));
+  const worker = new Worker(url);
 
-      const ready = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("Python took too long to load. Check your internet connection and try again.")), PYTHON_LOAD_TIMEOUT_MS);
-        worker.onmessage = ({ data }) => {
-          if (data.type === "ready") { clearTimeout(timer); resolve(worker); }
-          if (data.type === "failed") { clearTimeout(timer); reject(new Error(`Python could not start: ${data.message}`)); }
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Python took too long to load. Check your internet connection and try again.")), PYTHON_LOAD_TIMEOUT_MS);
+    worker.onmessage = ({ data }) => {
+      if (data.type === "ready") { clearTimeout(timer); resolve(worker); }
+      if (data.type === "failed") { clearTimeout(timer); reject(new Error(`Python could not start: ${data.message}`)); }
+    };
+    worker.onerror = (event) => { clearTimeout(timer); reject(new Error(`Python could not start: ${event.message || "unknown error"}`)); };
+  });
+
+  worker.postMessage({ type: "init", pyodideUrl: PYODIDE_URL, pythonSource: PYTHON_SOURCE, blockedNames: BLOCKED_BROWSER_APIS });
+  return ready.finally(() => URL.revokeObjectURL(url));
+}
+
+function getPythonWorker(log) {
+  if (!pythonWorker) {
+    pythonWorker = startPythonWorker(log).catch((error) => {
+      pythonWorker = null;
+      throw error;
+    });
+  }
+  return pythonWorker;
+}
+
+async function runPythonAnalysis(request, log) {
+  const worker = await getPythonWorker(log);
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      worker.terminate();
+      pythonWorker = null;
+      resolve({ timedOut: true });
+    }, RUN_TIMEOUT_MS);
+
+    worker.onmessage = ({ data }) => {
+      if (data.type !== "result") return;
+      clearTimeout(timer);
+      resolve(data.result);
+    };
+    worker.onerror = (event) => {
+      event.preventDefault();
+      clearTimeout(timer);
+      worker.terminate();
+      pythonWorker = null;
+      resolve({ workerFailed: event.message || "unknown error" });
+    };
+    worker.postMessage({ type: "run", request });
+  });
+}
+
+// ---------- Repair prompt (no DOM code here) ----------
+
+const CONTEXT_LINES = 3;
+const REPLY_RULE = "- Reply with only the complete corrected code in one code block. No explanation.";
+
+const SYNTAX_FIX_RULES = [
+  "Rules:",
+  "- Fix only this error. Do not rewrite, rename, reformat, or add features.",
+  "- If you spot other syntax errors, fix those too, and change nothing else.",
+  REPLY_RULE,
+];
+
+const LINT_FIX_RULES = [
+  "Rules:",
+  "- Fix every problem listed and change nothing else. Do not rewrite, rename, reformat, or add features.",
+  "- For a name that is not defined, either define it or use the correct name that already exists in the code. Do not delete the code that uses it.",
+  "- For a call with the wrong arguments, fix the call or the function definition, whichever matches what the code is meant to do. Keep every other call working.",
+  "- Problems marked [runtime] crashed when the code was run. Fix the cause of the crash.",
+  "- Problems marked [check] are tests written by the user. The corrected code must pass them.",
+  REPLY_RULE,
+];
+
+function buildContext(code, errorLine) {
+  const lines = code.split("\n");
+  const first = Math.max(1, errorLine - CONTEXT_LINES);
+  const last = Math.min(lines.length, errorLine + CONTEXT_LINES);
+  const width = String(last).length;
+
+  const rows = [];
+  for (let number = first; number <= last; number++) {
+    const marker = number === errorLine ? ">" : " ";
+    rows.push(`${marker} ${String(number).padStart(width)} | ${lines[number - 1]}`);
+  }
+  return rows.join("\n");
+}
+
+function fenceFor(code) {
+  const longestRun = (code.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+  return "`".repeat(Math.max(3, longestRun + 1));
+}
+
+function describeCodeType({ language, sourceType }) {
+  if (language === "python") return "Python 3";
+  if (sourceType === "module") return "JavaScript ES module";
+  if (sourceType === "script") return "JavaScript plain script";
+  return "JavaScript";
+}
+
+function assemblePrompt({ intro, task, language, sourceType, details, rules, code }) {
+  const fence = fenceFor(code);
+  const fenceLanguage = language === "python" ? "python" : "js";
+  const sections = [
+    intro,
+    task ? `What the code should do: ${task}` : null,
+    `Code type: ${describeCodeType({ language, sourceType })}`,
+    details,
+    rules.join("\n"),
+    `Full code:\n${fence}${fenceLanguage}\n${code}\n${fence}`,
+  ];
+  return sections.filter(Boolean).join("\n\n");
+}
+
+function buildSyntaxPrompt({ code, problem, language, sourceType, task }) {
+  const details = [
+    `Error: ${problem.message} (line ${problem.line}, column ${problem.column})`,
+    `Code around the error (">" marks the line):\n${buildContext(code, problem.line)}`,
+  ].join("\n\n");
+
+  return assemblePrompt({
+    intro: "Fix the syntax error in the code below.",
+    task, language, sourceType, details, code,
+    rules: SYNTAX_FIX_RULES,
+  });
+}
+
+function buildLintPrompt({ code, errors, language, sourceType, task }) {
+  const lines = code.split("\n");
+  const problems = errors.map((finding, index) => {
+    const rule = finding.ruleId ? ` [${finding.ruleId}]` : "";
+    const place = finding.line ? `Line ${finding.line}, column ${finding.column}: ` : "";
+    const heading = `${index + 1}. ${place}${finding.message}${rule}`;
+    const source = finding.line ? `\n   > ${(lines[finding.line - 1] ?? "").trim()}` : "";
+    return heading + source;
+  });
+
+  return assemblePrompt({
+    intro: "Fix the problems found in the code below.",
+    task, language, sourceType, code,
+    details: `Problems found:\n${problems.join("\n")}`,
+    rules: LINT_FIX_RULES,
+  });
+}
+
+// ---------- Finding labels and local telemetry ----------
+
+function kindOf(finding) {
+  if (finding.ruleId === "runtime" && /^The sandbox could not run the code/.test(finding.message)) return "not-checked";
+  return finding.severity === "error" ? "found" : "suggestion";
+}
+
+function basisFor(finding, context = {}) {
+  const id = finding.ruleId || "";
+  if (id === "runtime") {
+    if (/^The code did not finish/.test(finding.message)) return "the run was stopped at the time limit";
+    if (/^The sandbox could not run the code/.test(finding.message)) return "the sandbox itself failed to start";
+    return context.language === "python" ? "Zapple ran this code in the browser's Python" : "Zapple ran this code in a background sandbox";
+  }
+  if (id === "check") return "a line from the Checks box, run against this code";
+  if (id === "no-undef") return "compared with names declared in this code, the browser globals and the globals box";
+  if (id.startsWith("pyflakes/")) return `pyflakes ${id.slice("pyflakes/".length)}`;
+  if (id.startsWith("zapple/")) {
+    return context.language === "python"
+      ? "name defined once in this code and never reused as a variable or parameter"
+      : "read from this code's structure, without running it";
+  }
+  return `ESLint rule ${id}`;
+}
+
+function subjectOf(finding) {
+  if (finding.ruleId === "no-undef" || finding.ruleId === "pyflakes/UndefinedName") {
+    const match = /'([^']+)'/.exec(finding.message);
+    return match ? match[1] : null;
+  }
+  return null;
+}
+
+function labelFinding(finding, context) {
+  const subject = subjectOf(finding);
+  return {
+    ...finding,
+    kind: kindOf(finding),
+    basis: basisFor(finding, context),
+    subject,
+    key: `${finding.ruleId}|${subject ?? finding.message}`,
+  };
+}
+
+function buildLogRecord({ language, sourceType, code, findings, run, session, seq, engine }) {
+  return {
+    v: 1,
+    session, seq,
+    t: Date.now(),
+    lang: language === "python" ? "python" : "js",
+    sourceType: sourceType ?? null,
+    lines: code.split("\n").length,
+    engine: engine ?? {},
+    ran: {
+      status: run?.status ?? "not-run",
+      ms: run?.durationMs ?? null,
+      skipReason: run?.reason ?? run?.skipReason ?? null,
+    },
+    findings: findings.map((finding) => labelFinding(finding, { language }))
+      .map(({ line, ruleId, kind, basis, subject, key, message }) =>
+        ({ key, rule: ruleId, kind, line, subject, message, basis })),
+  };
+}
+
+// ---------- Local log (IndexedDB store: checks, counts, pairs) ----------
+
+const ZapLog = (() => {
+  const DB = 'zapple-log', KEEP = 200;
+  let dbp = null, keepCode = false;
+  let prev = null;
+
+  function open() {
+    if (!dbp) dbp = new Promise(resolve => {
+      try {
+        const r = indexedDB.open(DB, 1);
+        r.onupgradeneeded = () => {
+          const db = r.result;
+          db.createObjectStore('checks', { keyPath: 'id' });
+          db.createObjectStore('counts', { keyPath: 'key' });
+          db.createObjectStore('pairs',  { keyPath: 'key' });
         };
-        worker.onerror = (event) => { clearTimeout(timer); reject(new Error(`Python could not start: ${event.message || "unknown error"}`)); };
-      });
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = r.onblocked = () => resolve(null);
+      } catch (e) { resolve(null); }
+    });
+    return dbp;
+  }
 
-      worker.postMessage({ type: "init", pyodideUrl: PYODIDE_URL, pythonSource: PYTHON_SOURCE, blockedNames: BLOCKED_BROWSER_APIS });
-      return ready.finally(() => URL.revokeObjectURL(url));
-    }
+  async function run(store, mode, fn) {
+    const db = await open();
+    if (!db) return null;
+    return new Promise(resolve => {
+      try {
+        const t = db.transaction(store, mode);
+        const out = fn(t.objectStore(store));
+        t.oncomplete = () => resolve(out && 'result' in out ? out.result : out);
+        t.onerror = t.onabort = () => resolve(null);
+      } catch (e) { resolve(null); }
+    });
+  }
 
-    function getPythonWorker(log) {
-      if (!pythonWorker) {
-        pythonWorker = startPythonWorker(log).catch((error) => {
-          pythonWorker = null;   // let the next check try again from scratch
-          throw error;
-        });
+  const put = (s, v) => run(s, 'readwrite', o => o.put(v));
+  const get = (s, k) => run(s, 'readonly',  o => o.get(k));
+  const all = (s)    => run(s, 'readonly',  o => o.getAll());
+  const del = (s, k) => run(s, 'readwrite', o => o.delete(k));
+
+  async function bump(store, key, field, extra = {}) {
+    const cur = (await get(store, key)) || { key, ...extra };
+    cur[field] = (cur[field] || 0) + 1;
+    await put(store, cur);
+  }
+
+  async function hash(text) {
+    try {
+      const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+    } catch (e) { return 'nohash-' + text.length; }
+  }
+
+  const ID = /[A-Za-z_$][\w$]*$/g;
+  function swapped(prevLine, nextLine, subject) {
+    const a = prevLine.match(ID) || [], b = nextLine.match(ID) || [];
+    const as = new Set(a), bs = new Set(b);
+    const removed = a.filter(t => !bs.has(t)), added = b.filter(t => !as.has(t));
+    return removed.length === 1 && added.length === 1 && removed[0] === subject ? added[0] : null;
+  }
+
+  async function compare(p, rec, code) {
+    const now = new Set(rec.findings.map(f => f.key));
+    const pl = p.code.split('\n'), nl = code.split('\n');
+    for (const f of p.findings) {
+      const ck = rec.lang + '|' + f.rule;
+      if (now.has(f.key)) { await bump('counts', ck, 'stillNext'); continue; }
+      await bump('counts', ck, 'goneNext');
+      if (f.subject && f.line && pl.length === nl.length) {
+        const to = swapped(pl[f.line - 1] || '', nl[f.line - 1] || '', f.subject);
+        if (to) await bump('pairs', f.rule + '|' + f.subject + '|' + to, 'n',
+                           { rule: f.rule, from: f.subject, to });
       }
-      return pythonWorker;
     }
+  }
 
-    /**
-     * Sends code to the Python worker and waits for its answer.
-     * If the code has not finished in time, the worker is stopped (a fresh one starts next time)
-     * and { timedOut: true } is returned.
-     */
-    async function runPythonAnalysis(request, log) {
-      const worker = await getPythonWorker(log);
+  async function trim() {
+    const rows = await all('checks');
+    if (!rows || rows.length <= KEEP) return;
+    rows.sort((a, b) => a.t - b.t);
+    for (const r of rows.slice(0, rows.length - KEEP)) await del('checks', r.id);
+  }
 
-      return new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          worker.terminate();
-          pythonWorker = null;
-          resolve({ timedOut: true });
-        }, RUN_TIMEOUT_MS);
+  return {
+    setKeepCode(v) { keepCode = !!v; },
 
-        worker.onmessage = ({ data }) => {
-          if (data.type !== "result") return;
-          clearTimeout(timer);
-          resolve(data.result);
-        };
-        // If the worker itself dies (for example it runs out of memory), say so right away
-        // instead of waiting for the timer and calling it an infinite loop.
-        worker.onerror = (event) => {
-          event.preventDefault();
-          clearTimeout(timer);
-          worker.terminate();
-          pythonWorker = null;
-          resolve({ workerFailed: event.message || "unknown error" });
-        };
-        worker.postMessage({ type: "run", request });
-      });
+    async record(rec, code) {
+      try {
+        rec.id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        rec.codeHash = await hash(code);
+        rec.code = keepCode ? code : null;
+        await put('checks', rec);
+        for (const f of rec.findings) await bump('counts', rec.lang + '|' + f.rule, 'shown');
+        if (prev && prev.session === rec.session) await compare(prev, rec, code);
+        prev = { session: rec.session, code, findings: rec.findings };
+        await trim();
+      } catch (e) {}
+    },
+
+    async seenFixes(rule, subject) {
+      const rows = (await all('pairs')) || [];
+      return rows.filter(p => p.rule === rule && p.from === subject)
+                 .sort((a, b) => b.n - a.n).slice(0, 3);
+    },
+
+    async exportJsonl() {
+      const out = [];
+      for (const s of ['checks', 'counts', 'pairs'])
+        for (const r of (await all(s)) || []) out.push(JSON.stringify({ store: s, ...r }));
+      return out.join('\n');
+    },
+
+    async clear() {
+      for (const s of ['checks', 'counts', 'pairs'])
+        for (const r of (await all(s)) || []) await del(s, r.key || r.id);
     }
-
-    // ---------- Repair prompt (no DOM code here) ----------
-
-    const CONTEXT_LINES = 3;   // lines shown above and below the error
-
-    const REPLY_RULE = "- Reply with only the complete corrected code in one code block. No explanation.";
-
-    const SYNTAX_FIX_RULES = [
-      "Rules:",
-      "- Fix only this error. Do not rewrite, rename, reformat, or add features.",
-      "- If you spot other syntax errors, fix those too, and change nothing else.",
-      REPLY_RULE,
-    ];
-
-    const LINT_FIX_RULES = [
-      "Rules:",
-      "- Fix every problem listed and change nothing else. Do not rewrite, rename, reformat, or add features.",
-      "- For a name that is not defined, either define it or use the correct name that already exists in the code. Do not delete the code that uses it.",
-      "- For a call with the wrong arguments, fix the call or the function definition, whichever matches what the code is meant to do. Keep every other call working.",
-      "- Problems marked [runtime] crashed when the code was run. Fix the cause of the crash.",
-      "- Problems marked [check] are tests written by the user. The corrected code must pass them.",
-      REPLY_RULE,
-    ];
-
-    /** Numbered lines around the error, with ">" marking the bad one. */
-    function buildContext(code, errorLine) {
-      const lines = code.split("\n");
-      const first = Math.max(1, errorLine - CONTEXT_LINES);
-      const last = Math.min(lines.length, errorLine + CONTEXT_LINES);
-      const width = String(last).length;
-
-      const rows = [];
-      for (let number = first; number <= last; number++) {
-        const marker = number === errorLine ? ">" : " ";
-        rows.push(`${marker} ${String(number).padStart(width)} | ${lines[number - 1]}`);
-      }
-      return rows.join("\n");
-    }
-
-    /** A code fence longer than any backtick run inside the code, so the code can't break out of it. */
-    function fenceFor(code) {
-      const longestRun = (code.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
-      return "`".repeat(Math.max(3, longestRun + 1));
-    }
-
-    /** What kind of code this is, in words the AI understands. */
-    function describeCodeType({ language, sourceType }) {
-      if (language === "python") return "Python 3";
-      if (sourceType === "module") return "JavaScript ES module";
-      if (sourceType === "script") return "JavaScript plain script";
-      return "JavaScript";
-    }
-
-    /** The parts every repair prompt shares; each check supplies its own intro, details and rules. */
-    function assemblePrompt({ intro, task, language, sourceType, details, rules, code }) {
-      const fence = fenceFor(code);
-      const fenceLanguage = language === "python" ? "python" : "js";
-      const sections = [
-        intro,
-        task ? `What the code should do: ${task}` : null,
-        `Code type: ${describeCodeType({ language, sourceType })}`,
-        details,
-        rules.join("\n"),
-        `Full code:\n${fence}${fenceLanguage}\n${code}\n${fence}`,
-      ];
-      return sections.filter(Boolean).join("\n\n");
-    }
-
-    function buildSyntaxPrompt({ code, problem, language, sourceType, task }) {
-      const details = [
-        `Error: ${problem.message} (line ${problem.line}, column ${problem.column})`,
-        `Code around the error (">" marks the line):\n${buildContext(code, problem.line)}`,
-      ].join("\n\n");
-
-      return assemblePrompt({
-        intro: "Fix the syntax error in the code below.",
-        task, language, sourceType, details, code,
-        rules: SYNTAX_FIX_RULES,
-      });
-    }
-
-    function buildLintPrompt({ code, errors, language, sourceType, task }) {
-      const lines = code.split("\n");
-      const problems = errors.map((finding, index) => {
-        const rule = finding.ruleId ? ` [${finding.ruleId}]` : "";
-        const place = finding.line ? `Line ${finding.line}, column ${finding.column}: ` : "";
-        const heading = `${index + 1}. ${place}${finding.message}${rule}`;
-        const source = finding.line ? `\n   > ${(lines[finding.line - 1] ?? "").trim()}` : "";
-        return heading + source;
-      });
-
-      return assemblePrompt({
-        intro: "Fix the problems found in the code below.",
-        task, language, sourceType, code,
-        details: `Problems found:\n${problems.join("\n")}`,
-        rules: LINT_FIX_RULES,
-      });
-    }
-
-    // ---------- Finding labels and the local log (no DOM code here) ----------
-    // Wording spec, section 1: every message carries a `basis` (the evidence, never a score),
-    // and a `kind`: "found" (Zapple saw it), "suggestion" (listed what it compared with) or
-    // "not-checked" (skipped, with a reason). These labels are added next to the original
-    // findings; the producers above are unchanged.
-
-    function kindOf(finding) {
-      // A sandbox that fails to start is an environment failure, not a code error.
-      if (finding.ruleId === "runtime" && /^The sandbox could not run the code/.test(finding.message)) return "not-checked";
-      return finding.severity === "error" ? "found" : "suggestion";
-    }
-
-    function basisFor(finding, context = {}) {
-      const id = finding.ruleId || "";
-      if (id === "runtime") {
-        if (/^The code did not finish/.test(finding.message)) return "the run was stopped at the time limit";
-        if (/^The sandbox could not run the code/.test(finding.message)) return "the sandbox itself failed to start";
-        return context.language === "python" ? "Zapple ran this code in the browser's Python" : "Zapple ran this code in a background sandbox";
-      }
-      if (id === "check") return "a line from the Checks box, run against this code";
-      if (id === "no-undef") return "compared with names declared in this code, the browser globals and the globals box";
-      if (id.startsWith("pyflakes/")) return `pyflakes ${id.slice("pyflakes/".length)}`;
-      if (id.startsWith("zapple/")) {
-        return context.language === "python"
-          ? "name defined once in this code and never reused as a variable or parameter"
-          : "read from this code's structure, without running it";
-      }
-      return `ESLint rule ${id}`;
-    }
-
-    // The name a finding is about, where the message makes that certain.
-    function subjectOf(finding) {
-      if (finding.ruleId === "no-undef" || finding.ruleId === "pyflakes/UndefinedName") {
-        const match = /'([^']+)'/.exec(finding.message);
-        return match ? match[1] : null;
-      }
-      return null;
-    }
-
-    /** Labels a finding without changing how it was produced. */
-    function labelFinding(finding, context) {
-      const subject = subjectOf(finding);
-      return {
-        ...finding,
-        kind: kindOf(finding),
-        basis: basisFor(finding, context),
-        subject,
-        key: `${finding.ruleId}|${subject ?? finding.message}`,   // survives line shifts
-      };
-    }
-
-    /** One log record per finished check (shape from the wording spec, section 5). */
-    function buildLogRecord({ language, sourceType, code, findings, run, session, seq, engine }) {
-      return {
-        v: 1,
-        session, seq,
-        t: Date.now(),
-        lang: language === "python" ? "python" : "js",
-        sourceType: sourceType ?? null,
-        lines: code.split("\n").length,
-        engine: engine ?? {},
-        ran: {
-          status: run?.status ?? "not-run",
-          ms: run?.durationMs ?? null,
-          skipReason: run?.reason ?? run?.skipReason ?? null,
-        },
-        findings: findings.map((finding) => labelFinding(finding, { language }))
-          .map(({ line, ruleId, kind, basis, subject, key, message }) =>
-            ({ key, rule: ruleId, kind, line, subject, message, basis })),
-      };
-    }
-
-    // ---------- Local log (wording spec, section 6) ----------
-    // Three IndexedDB stores: checks (last 200 records), counts (running totals per rule),
-    // pairs (name changes seen between consecutive checks). Everything is wrapped so the page
-    // works when storage is empty or blocked, and logging never breaks a check.
-    const ZapLog = (() => {
-      const DB = 'zapple-log', KEEP = 200;
-      let dbp = null, keepCode = false;
-      let prev = null; // in memory only, never saved: { session, code, findings }
-
-      function open() {
-        if (!dbp) dbp = new Promise(resolve => {
-          try {
-            const r = indexedDB.open(DB, 1);
-            r.onupgradeneeded = () => {
-              const db = r.result;
-              db.createObjectStore('checks', { keyPath: 'id' });
-              db.createObjectStore('counts', { keyPath: 'key' });
-              db.createObjectStore('pairs',  { keyPath: 'key' });
-            };
-            r.onsuccess = () => resolve(r.result);
-            r.onerror = r.onblocked = () => resolve(null);
-          } catch (e) { resolve(null); }
-        });
-        return dbp;
-      }
-
-      async function run(store, mode, fn) {
-        const db = await open();
-        if (!db) return null;
-        return new Promise(resolve => {
-          try {
-            const t = db.transaction(store, mode);
-            const out = fn(t.objectStore(store));
-            t.oncomplete = () => resolve(out && 'result' in out ? out.result : out);
-            t.onerror = t.onabort = () => resolve(null);
-          } catch (e) { resolve(null); }
-        });
-      }
-
-      const put = (s, v) => run(s, 'readwrite', o => o.put(v));
-      const get = (s, k) => run(s, 'readonly',  o => o.get(k));
-      const all = (s)    => run(s, 'readonly',  o => o.getAll());
-      const del = (s, k) => run(s, 'readwrite', o => o.delete(k));
-
-      async function bump(store, key, field, extra = {}) {
-        const cur = (await get(store, key)) || { key, ...extra };
-        cur[field] = (cur[field] || 0) + 1;
-        await put(store, cur);
-      }
-
-      async function hash(text) {
-        try {
-          const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-          return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
-        } catch (e) { return 'nohash-' + text.length; }
-      }
-
-      // If exactly one identifier on the line changed, and it was the flagged one,
-      // return the identifier that replaced it. Otherwise null.
-      const ID = /[A-Za-z_$][\w$]*/g;
-      function swapped(prevLine, nextLine, subject) {
-        const a = prevLine.match(ID) || [], b = nextLine.match(ID) || [];
-        const as = new Set(a), bs = new Set(b);
-        const removed = a.filter(t => !bs.has(t)), added = b.filter(t => !as.has(t));
-        return removed.length === 1 && added.length === 1 && removed[0] === subject ? added[0] : null;
-      }
-
-      async function compare(p, rec, code) {
-        const now = new Set(rec.findings.map(f => f.key));
-        const pl = p.code.split('\n'), nl = code.split('\n');
-        for (const f of p.findings) {
-          const ck = rec.lang + '|' + f.rule;
-          if (now.has(f.key)) { await bump('counts', ck, 'stillNext'); continue; }
-          await bump('counts', ck, 'goneNext');
-          // only compare lines when the line count is unchanged, so lines still line up
-          if (f.subject && f.line && pl.length === nl.length) {
-            const to = swapped(pl[f.line - 1] || '', nl[f.line - 1] || '', f.subject);
-            if (to) await bump('pairs', f.rule + '|' + f.subject + '|' + to, 'n',
-                               { rule: f.rule, from: f.subject, to });
-          }
-        }
-      }
-
-      async function trim() {
-        const rows = await all('checks');
-        if (!rows || rows.length <= KEEP) return;
-        rows.sort((a, b) => a.t - b.t);
-        for (const r of rows.slice(0, rows.length - KEEP)) await del('checks', r.id);
-      }
-
-      return {
-        setKeepCode(v) { keepCode = !!v; },
-
-        // call once per finished check; rec follows the spec's section 5 shape without id/codeHash/code
-        async record(rec, code) {
-          try {
-            rec.id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-            rec.codeHash = await hash(code);
-            rec.code = keepCode ? code : null;
-            await put('checks', rec);
-            for (const f of rec.findings) await bump('counts', rec.lang + '|' + f.rule, 'shown');
-            if (prev && prev.session === rec.session) await compare(prev, rec, code);
-            prev = { session: rec.session, code, findings: rec.findings };
-            await trim();
-          } catch (e) { /* logging must never break a check */ }
-        },
-
-        // for the "Seen before" suggestion line
-        async seenFixes(rule, subject) {
-          const rows = (await all('pairs')) || [];
-          return rows.filter(p => p.rule === rule && p.from === subject)
-                     .sort((a, b) => b.n - a.n).slice(0, 3);
-        },
-
-        async exportJsonl() {
-          const out = [];
-          for (const s of ['checks', 'counts', 'pairs'])
-            for (const r of (await all(s)) || []) out.push(JSON.stringify({ store: s, ...r }));
-          return out.join('\n');
-        },
-
-        async clear() {
-          for (const s of ['checks', 'counts', 'pairs'])
-            for (const r of (await all(s)) || []) await del(s, r.key || r.id);
-        }
-      };
-    })();
+  };
+})();
