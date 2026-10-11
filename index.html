@@ -2,58 +2,146 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#EFEBE6" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#25272C" media="(prefers-color-scheme: dark)">
   <title>Zapple</title>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=VT323&family=Courier+Prime&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <script src="browser-globals.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <main>
-    <h1>Zapple</h1>
-    <p class="subtitle">Checks AI-written codes here before you use it</p>
+  <div class="app">
 
-    <label for="code-input">Paste code</label>
-    <textarea id="code-input" spellcheck="false" autocapitalize="off" autocomplete="off"
-              placeholder="Paste JavaScript here"></textarea>
+    <!-- Top bar: brand on the left, the JS / PY pill switch on the right -->
+    <header class="top">
+      <div class="brand">
+        <svg viewBox="0 0 40 40" aria-hidden="true">
+          <circle cx="19" cy="23" r="13" fill="var(--good)"/>
+          <path d="M20 10c0-4 3-7 8-8-.5 5-3 8-8 8z" fill="var(--ink)"/>
+          <path d="M21 15l-6 9h5l-2 7 7-10h-5z" fill="var(--bg)"/>
+        </svg>
+        <h1>Zapple</h1>
+      </div>
 
-    <div class="field">
-      <label for="task-input">What should this code do? (optional)</label>
-      <input id="task-input" type="text" autocomplete="off"
-             placeholder="One sentence, included in the repair prompt">
-    </div>
+      <div class="seg" role="group" aria-label="Language">
+        <button type="button" data-lang="javascript" aria-pressed="true">JS<span class="vh"> (JavaScript)</span></button>
+        <button type="button" data-lang="python" aria-pressed="false">PY<span class="vh"> (Python)</span></button>
+      </div>
 
-    <div class="field">
-      <label for="globals-input">Extra names the code may use (optional)</label>
-      <input id="globals-input" type="text" autocomplete="off" autocapitalize="off"
-             placeholder="Names from libraries you load, like THREE, Chart">
-    </div>
-
-    <div class="field">
-      <label id="checks-label" for="checks-input">Checks (optional): one JavaScript expression per line</label>
-      <textarea id="checks-input" class="checks-box" spellcheck="false" autocapitalize="off"
-                placeholder="add(2, 3) === 5"></textarea>
-    </div>
-
-    <div class="controls">
-      <select id="language" aria-label="Language">
+      <!-- The real language control. ui.js reads it, and the pill switch above drives it. -->
+      <select id="language" aria-label="Language" hidden>
         <option value="javascript">JavaScript</option>
         <option value="python">Python</option>
       </select>
-      <button id="clear-button" type="button">Clear</button>
-      <button id="check-button" type="button" class="primary">Check</button>
+    </header>
+    <p class="subtitle">Checks AI-written JavaScript and Python before you use it</p>
+
+    <main>
+      <!-- Tab 1: the form -->
+      <section id="p-code" role="tabpanel" aria-labelledby="t-code" class="panel code-panel">
+        <div class="card">
+          <div class="card-hd">
+            <label for="code-input">Paste code</label>
+            <button id="clear-button" type="button" class="btn sm">Clear</button>
+          </div>
+          <textarea id="code-input" spellcheck="false" autocapitalize="off" autocomplete="off"
+                    placeholder="Paste JavaScript here"></textarea>
+        </div>
+
+        <div class="card fields">
+          <div class="field">
+            <label for="task-input">What should this code do? (optional)</label>
+            <input id="task-input" type="text" autocomplete="off"
+                   placeholder="One sentence, included in the repair prompt">
+          </div>
+
+          <div class="field">
+            <label for="globals-input">Extra names the code may use (optional)</label>
+            <input id="globals-input" type="text" autocomplete="off" autocapitalize="off"
+                   placeholder="Names from libraries you load, like THREE, Chart">
+          </div>
+
+          <div class="field">
+            <label id="checks-label" for="checks-input">Checks (optional): one JavaScript expression per line</label>
+            <textarea id="checks-input" class="checks-box" spellcheck="false" autocapitalize="off"
+                      placeholder="add(2, 3) === 5"></textarea>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 2: what Zapple found. ui.js fills #summary and #result. -->
+      <section id="p-results" role="tabpanel" aria-labelledby="t-results" class="panel" hidden>
+        <div id="empty" class="card empty">
+          <svg viewBox="0 0 200 200" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="200" height="200" fill="var(--sky)"/>
+            <g fill="var(--cloud)" opacity=".85"><ellipse cx="50" cy="38" rx="28" ry="11"/><ellipse cx="72" cy="32" rx="18" ry="10"/><ellipse cx="150" cy="58" rx="30" ry="10"/><ellipse cx="170" cy="52" rx="16" ry="9"/></g>
+            <path d="M0 128c30-26 62-30 96-10 32 18 70 12 104-14V200H0z" fill="var(--h1)"/>
+            <path d="M0 150c36-22 70-18 104 2 34 18 64 10 96-8V200H0z" fill="var(--h2)"/>
+            <path d="M0 176c40-14 80-10 120 4 30 10 56 6 80-6V200H0z" fill="var(--h3)"/>
+            <g fill="var(--flower)"><circle cx="30" cy="176" r="2.4"/><circle cx="44" cy="183" r="2.4"/><circle cx="62" cy="178" r="2.4"/><circle cx="150" cy="184" r="2.4"/><circle cx="166" cy="178" r="2.4"/></g>
+          </svg>
+          <h2>Nothing checked yet</h2>
+          <p class="hint">Paste code on the Code tab, then press Check.</p>
+        </div>
+
+        <div id="summary" class="sum" data-tone="good" hidden>
+          <div class="card ringcard">
+            <div class="ring">
+              <svg viewBox="0 0 180 180" aria-hidden="true">
+                <circle class="track" cx="90" cy="90" r="70"/>
+                <circle class="arc" id="ring-arc" cx="90" cy="90" r="70" stroke-dasharray="439.8" stroke-dashoffset="439.8"/>
+              </svg>
+              <p class="mid"><b id="ring-main">✓</b><span class="lbl" id="ring-sub">Clear</span></p>
+            </div>
+          </div>
+
+          <section class="card verdict" aria-labelledby="verdict-label">
+            <h2 class="lbl" id="verdict-label"><span class="dot" aria-hidden="true"></span>Verdict</h2>
+            <strong id="verdict-head"></strong>
+            <span id="verdict-sub"></span>
+          </section>
+
+          <section class="card tiles" aria-label="This check at a glance">
+            <dl>
+              <div class="tile"><dt>Problems</dt><dd class="num" id="tile-problems">0</dd><dd class="sub" id="tile-problems-sub"></dd></div>
+              <div class="tile"><dt>Notes</dt><dd class="num" id="tile-notes">0</dd><dd class="sub" id="tile-notes-sub"></dd></div>
+              <div class="tile"><dt>Checks passed</dt><dd class="num" id="tile-checks">0</dd><dd class="sub" id="tile-checks-sub"></dd></div>
+            </dl>
+          </section>
+        </div>
+
+        <div id="result"></div>
+      </section>
+
+      <!-- Tab 3: what Zapple did behind the scenes -->
+      <section id="p-log" role="tabpanel" aria-labelledby="t-log" class="panel" hidden>
+        <div class="card">
+          <h2>What Zapple did</h2>
+          <p class="hint">Behind the scenes, in order.</p>
+          <pre id="log-output" class="code-frame log-output">Nothing has run yet.</pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Bottom dock: three tabs and the main action -->
+  <div class="dock">
+    <div role="tablist" aria-label="Sections">
+      <button type="button" role="tab" id="t-code" aria-selected="true" aria-controls="p-code">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8l-4 4 4 4"/><path d="M16 8l4 4-4 4"/><path d="M13.5 6l-3 12"/></svg>Code</button>
+      <button type="button" role="tab" id="t-results" aria-selected="false" aria-controls="p-results" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>Results</button>
+      <button type="button" role="tab" id="t-log" aria-selected="false" aria-controls="p-log" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6l5 5-5 5"/><path d="M12 18h8"/></svg>Log</button>
     </div>
+    <button id="check-button" type="button" class="primary cta">Check</button>
+  </div>
 
-    <div id="result" aria-live="polite"></div>
-
-    <details class="log">
-      <summary>Log</summary>
-      <pre id="log-output" class="code-frame log-output">Nothing has run yet.</pre>
-    </details>
-  </main>
+  <p class="vh" id="live" role="status" aria-live="polite"></p>
 
   <!-- The bot mascot. bot.js finds it by the ids bots, bubble and orb. -->
   <div class="bots-wrap">

@@ -8,6 +8,9 @@ const globalsInput = document.getElementById("globals-input");
 const checksInput = document.getElementById("checks-input");
 const resultPanel = document.getElementById("result");
 const checkButton = document.getElementById("check-button");
+const emptyState  = document.getElementById("empty");     // "Nothing checked yet" card on the Results tab
+const summaryBox  = document.getElementById("summary");   // ring, verdict and tiles on the Results tab
+const liveStatus  = document.getElementById("live");      // read aloud by screen readers when a check finishes
 const log = createLog(document.getElementById("log-output"));
 
 /** Creates an element with optional class and text (textContent keeps pasted code inert). */
@@ -18,8 +21,97 @@ function el(tag, className, text) {
   return node;
 }
 
+/**
+ * Puts boxes into the Results tab and switches to it. Boxes with the class "side" (repair prompt,
+ * call map, console output) form a second column on wide screens; the rest form the first.
+ * Called with nothing, it empties the tab (used by Clear).
+ */
 function showResult(...nodes) {
-  resultPanel.replaceChildren(...nodes);
+  const column = (className, items) => {
+    const wrap = el("div", className);
+    wrap.append(...items);
+    return wrap;
+  };
+  const side = nodes.filter((node) => node.classList.contains("side"));
+  const main = nodes.filter((node) => !node.classList.contains("side"));
+  const columns = [];
+  if (main.length > 0) columns.push(column("res-main", main));
+  if (side.length > 0) columns.push(column("res-side", side));
+
+  resultPanel.classList.toggle("two", columns.length === 2);
+  resultPanel.replaceChildren(...columns);
+  emptyState.hidden = nodes.length > 0;
+  if (nodes.length === 0) {
+    setSummary(null);
+  } else {
+    goToTab("results");
+  }
+}
+
+/**
+ * Fills the ring, verdict and three tiles at the top of the Results tab. Pass null to hide them.
+ * tone is "good", "warn" or "bad"; tiles is [Problems, Notes, Checks passed], each { value, sub, tone }.
+ */
+function setSummary(summary) {
+  if (!summary) {
+    summaryBox.hidden = true;
+    return;
+  }
+  const { tone, headline, detail, tiles } = summary;
+  summaryBox.dataset.tone = tone;
+  summaryBox.hidden = false;
+
+  const ring = { good: ["✓", "Clear"], warn: ["!", "Not run"], bad: [String(tiles[0].value), "Problems"] }[tone];
+  document.getElementById("ring-main").textContent = ring[0];
+  document.getElementById("ring-sub").textContent = ring[1];
+  document.getElementById("verdict-head").textContent = headline;
+  document.getElementById("verdict-sub").textContent = detail;
+  ["problems", "notes", "checks"].forEach((name, index) => {
+    const number = document.getElementById(`tile-${name}`);
+    number.textContent = tiles[index].value;
+    number.dataset.tone = tiles[index].tone;
+    document.getElementById(`tile-${name}-sub`).textContent = tiles[index].sub;
+  });
+
+  // Redraw the ring from empty. Two animation frames wait until the Results tab is on screen.
+  const arc = document.getElementById("ring-arc");
+  arc.style.transition = "none";
+  arc.style.strokeDashoffset = "439.8";
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    arc.style.transition = "";
+    arc.style.strokeDashoffset = "0";
+  }));
+  liveStatus.textContent = headline;
+}
+
+/** "JavaScript · 16 lines · checked 17:42", the small line under the verdict. */
+function summaryDetail() {
+  const lines = codeInput.value.split("\n").length;
+  const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return `${languageSelect.selectedOptions[0].textContent} · ${countLabel(lines, "line")} · checked ${time}`;
+}
+
+function buildReportSummary({ errors, notes, run }) {
+  const skipped = run.status === "skipped";
+  const clean = errors.length === 0;
+  let checks;
+  if (clean && !skipped) {
+    const count = run.checkCount ?? 0;
+    checks = { value: count, sub: count > 0 ? "all passed" : "none written", tone: count > 0 ? "good" : "" };
+  } else {
+    checks = { value: "–", sub: skipped ? "not run" : "see problems", tone: "" };
+  }
+  return {
+    tone: !clean ? "bad" : skipped ? "warn" : "good",
+    headline: !clean ? `Hold: ${countLabel(errors.length, "problem")} to fix`
+      : skipped ? "No errors, but not test-run" : "Clear to use",
+    detail: summaryDetail(),
+    tiles: [
+      { value: errors.length, sub: clean ? "none found" : "to fix", tone: clean ? "good" : "bad" },
+      { value: notes.length, sub: notes.length > 0 ? "worth a look" : "none", tone: notes.length > 0 ? "warn" : "" },
+      checks,
+    ],
+  };
 }
 
 function buildMessageBox(kind, title, detail) {
@@ -30,8 +122,9 @@ function buildMessageBox(kind, title, detail) {
 }
 
 function showMessage(kind, title, detail) {
+  setSummary(null);              // a plain message is not a verdict, so no ring or tiles
+  liveStatus.textContent = title;
   showResult(buildMessageBox(kind, title, detail));
-  if (kind === "error") updateBot("fail", `${title}.`);
 }
 
 /** Shows the bad line with a caret under the problem column. */
@@ -45,7 +138,7 @@ function buildCodeFrame({ line, column, sourceLine }) {
 
 function showSyntaxError(problem, promptText) {
   const box = el("div", "result error");
-  const jumpButton = el("button", "", `Go to line ${problem.line}`);
+  const jumpButton = el("button", "btn sm", `Go to line ${problem.line}`);
   jumpButton.type = "button";
   jumpButton.addEventListener("click", () => selectLine(problem.line));
 
@@ -55,8 +148,14 @@ function showSyntaxError(problem, promptText) {
     buildCodeFrame(problem),
     jumpButton
   );
+  const notReached = { value: "–", sub: "not reached", tone: "" };
+  setSummary({
+    tone: "bad",
+    headline: "Hold: syntax error",
+    detail: `Line ${problem.line}, column ${problem.column}`,
+    tiles: [{ value: 1, sub: "to fix", tone: "bad" }, notReached, notReached],
+  });
   showResult(box, buildPromptSection(promptText));
-  updateBot("fail", "Syntax error. Details below.");
 }
 
 /** The repair prompt in a read-only box, with a button that copies it. */
@@ -69,12 +168,14 @@ function buildPromptSection(promptText) {
   promptBox.readOnly = true;
   promptBox.value = promptText;
 
-  const copyButton = el("button", "primary", "Copy repair prompt");
+  const copyButton = el("button", "btn", "Copy repair prompt");
   copyButton.type = "button";
   copyButton.addEventListener("click", () => copyPrompt(promptBox, copyButton));
 
-  const section = el("div", "prompt-section");
-  section.append(label, promptBox, copyButton);
+  const hint = el("p", "hint", "Every problem in one message, so one round trip to the AI is enough.");
+
+  const section = el("div", "prompt-section side");
+  section.append(label, promptBox, copyButton, hint);
   return section;
 }
 
@@ -90,11 +191,6 @@ async function copyPrompt(promptBox, button) {
   }
 }
 
-/** Tells the little bot how the check went. The page works the same without bot.js. */
-function updateBot(state, message) {
-  if (window.setBotState) window.setBotState(state, message);
-}
-
 /** Shows a message on a button for two seconds, then restores its label. */
 function flashLabel(button, message) {
   const original = button.textContent;
@@ -106,14 +202,17 @@ function countLabel(count, noun) {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
-/** One tappable row per finding; tapping jumps to that line in the code box. */
+/** One row per finding. With a line number it is a button that jumps to that line in the code box. */
 function buildFindingList(findings) {
   const list = el("ul", "finding-list");
   for (const finding of findings) {
-    const label = finding.line ? `Line ${finding.line}: ${finding.message}` : finding.message;
-    const row = el("button", "finding", label);
-    row.type = "button";
-    if (finding.line) row.addEventListener("click", () => selectLine(finding.line));
+    const row = el(finding.line ? "button" : "div", "finding");
+    if (finding.line) {
+      row.type = "button";
+      row.append(el("span", "chip", `Line ${finding.line}`));
+      row.addEventListener("click", () => selectLine(finding.line));
+    }
+    row.append(el("span", "finding-text", finding.message));
     const item = el("li");
     item.append(row);
     list.append(item);
@@ -122,7 +221,7 @@ function buildFindingList(findings) {
 }
 
 function buildFindingsBox(kind, title, findings) {
-  const box = el("div", `result ${kind}`);
+  const box = el("div", `result ${kind}${kind === "note" ? " flagged" : ""}`);
   box.append(el("p", "result-title", title), buildFindingList(findings));
   return box;
 }
@@ -144,10 +243,11 @@ function describeRunOutcome(run) {
   return `No errors found. The code ran without crashing (${run.durationMs} ms).${checks}`;
 }
 
-/** A titled box of preformatted text (used for the call map and the console output). */
-function buildTextBox(title, text) {
-  const box = el("div", "result note");
-  box.append(el("p", "result-title", title), el("pre", "code-frame", text));
+/** A foldable, titled box of preformatted text (used for the call map and the console output). */
+function buildTextBox(title, text, open = false) {
+  const box = el("details", "result note textbox side");
+  box.open = open;
+  box.append(el("summary", "result-title", title), el("pre", "code-frame", text));
   return box;
 }
 
@@ -198,24 +298,23 @@ function showReport({ errors, notes, callMap, run, promptText, untraced = { coun
   if (notes.length > 0) {
     blocks.push(buildFindingsBox("note", countLabel(notes.length, "note"), notes));
   }
+  // The repair prompt comes first among the side boxes, because it is what most people want next
+  if (promptText) {
+    blocks.push(buildPromptSection(promptText));
+  }
   if (callMap) {
     blocks.push(buildTextBox("Call map", callMap));
   }
   if (run.output.length > 0) {
-    blocks.push(buildTextBox("Console output", run.output.join("\n")));
+    blocks.push(buildTextBox("Console output", run.output.join("\n"), true));
   }
-  if (promptText) {
-    blocks.push(buildPromptSection(promptText));
-  }
+  setSummary(buildReportSummary({ errors, notes, run }));
   showResult(...blocks);
-
-  if (errors.length > 0) updateBot("fail", `${countLabel(errors.length, "problem")} found. Details below.`);
-  else if (run.status === "skipped") updateBot("cantrun", "Couldn't test-run this. The reason is below.");
-  else updateBot("pass");
 }
 
 /** Highlights a line inside the textarea so it can be fixed right away. */
 function selectLine(lineNumber) {
+  goToTab("code");    // the code box lives on the Code tab
   const lines = codeInput.value.split("\n");
   const start = lines.slice(0, lineNumber - 1).reduce((sum, text) => sum + text.length + 1, 0);
   codeInput.focus();
@@ -386,7 +485,7 @@ function handleClear() {
 
 checkButton.addEventListener("click", async () => {
   checkButton.disabled = true;   // no second run while the sandbox is busy
-  updateBot("checking");
+  checkButton.textContent = "Checking…";
   try {
     await handleCheck();
   } catch (error) {
@@ -394,6 +493,7 @@ checkButton.addEventListener("click", async () => {
     showMessage("error", "Something went wrong", error.message);
   } finally {
     checkButton.disabled = false;
+    checkButton.textContent = "Check";
   }
 });
 // The hint texts follow the chosen language, so the boxes always describe what to type there
@@ -422,3 +522,57 @@ function applyLanguage() {
 
 languageSelect.addEventListener("change", applyLanguage);
 document.getElementById("clear-button").addEventListener("click", handleClear);
+
+// ---------- Tabs ----------
+const TAB_NAMES = ["code", "results", "log"];
+
+/** Shows one tab and hides the other two. */
+function goToTab(name, { focus = false } = {}) {
+  for (const tabName of TAB_NAMES) {
+    const selected = tabName === name;
+    const tab = document.getElementById(`t-${tabName}`);
+    document.getElementById(`p-${tabName}`).hidden = !selected;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    if (selected && focus) tab.focus();
+  }
+  window.scrollTo({ top: 0 });
+}
+
+TAB_NAMES.forEach((name, index) => {
+  const tab = document.getElementById(`t-${name}`);
+  tab.addEventListener("click", () => goToTab(name));
+  // Arrow keys, Home and End move between tabs, as people expect from a tab bar
+  tab.addEventListener("keydown", (event) => {
+    const step = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
+    let target;
+    if (step) target = TAB_NAMES[(index + step + TAB_NAMES.length) % TAB_NAMES.length];
+    else if (event.key === "Home") target = TAB_NAMES[0];
+    else if (event.key === "End") target = TAB_NAMES[TAB_NAMES.length - 1];
+    if (!target) return;
+    event.preventDefault();
+    goToTab(target, { focus: true });
+  });
+});
+
+// ---------- JS / PY pill switch ----------
+// The hidden <select id="language"> is still the one real language control; the pills just drive it.
+const languagePills = document.querySelectorAll("[data-lang]");
+
+function syncLanguagePills() {
+  for (const pill of languagePills) {
+    pill.setAttribute("aria-pressed", String(pill.dataset.lang === languageSelect.value));
+  }
+}
+
+for (const pill of languagePills) {
+  pill.addEventListener("click", () => {
+    languageSelect.value = pill.dataset.lang;
+    languageSelect.dispatchEvent(new Event("change"));   // runs applyLanguage, same as the old dropdown did
+  });
+}
+languageSelect.addEventListener("change", syncLanguagePills);
+
+// Browsers can restore an old selection on reload, so bring the hint texts and pills in line with it
+applyLanguage();
+syncLanguagePills();
