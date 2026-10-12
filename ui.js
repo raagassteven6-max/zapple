@@ -13,6 +13,11 @@ const summaryBox  = document.getElementById("summary");   // ring, verdict and t
 const liveStatus  = document.getElementById("live");      // read aloud by screen readers when a check finishes
 const log = createLog(document.getElementById("log-output"));
 
+/** Tells the mascot what happened ("checking", "pass", "fail", "cantrun"). Safe if bot.js did not load. */
+function botState(state, message) {
+  if (typeof window.setBotState === "function") window.setBotState(state, message);
+}
+
 /** Creates an element with optional class and text (textContent keeps pasted code inert). */
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -124,6 +129,7 @@ function buildMessageBox(kind, title, detail) {
 function showMessage(kind, title, detail) {
   setSummary(null);              // a plain message is not a verdict, so no ring or tiles
   liveStatus.textContent = title;
+  botState("cantrun", title);    // "Nothing to check", "Parser not loaded"...: nothing was verified
   showResult(buildMessageBox(kind, title, detail));
 }
 
@@ -155,6 +161,7 @@ function showSyntaxError(problem, promptText) {
     detail: `Line ${problem.line}, column ${problem.column}`,
     tiles: [{ value: 1, sub: "to fix", tone: "bad" }, notReached, notReached],
   });
+  botState("fail");
   showResult(box, buildPromptSection(promptText));
 }
 
@@ -309,6 +316,7 @@ function showReport({ errors, notes, callMap, run, promptText, untraced = { coun
     blocks.push(buildTextBox("Console output", run.output.join("\n"), true));
   }
   setSummary(buildReportSummary({ errors, notes, run }));
+  botState(errors.length > 0 ? "fail" : run.status === "skipped" ? "cantrun" : "pass");
   showResult(...blocks);
 }
 
@@ -486,6 +494,7 @@ function handleClear() {
 checkButton.addEventListener("click", async () => {
   checkButton.disabled = true;   // no second run while the sandbox is busy
   checkButton.textContent = "Checking…";
+  botState("checking");
   try {
     await handleCheck();
   } catch (error) {

@@ -21,7 +21,10 @@
   --warn: #8A5A00;  --warn-soft: #F3E6C6;
   --cta-bg: #1B1816;  --cta-fg: #F6F2EC;   /* the black pill */
   --focus: #2457D6;
-  --orb-ok: #4FA36F;  --orb-bad: #DB5B3F;  --orb-warn: #DDA53B;   /* the bot */
+  /* the bot: cream rubber. Light edge, mid body, shaded edge, lit shoulder, shadow edge, eye ink, cheek blush */
+  --bot-hi: #FFFDF8;  --bot-mid: #F4EEE4;  --bot-lo: #E2D6C6;
+  --bot-lit: rgba(255, 255, 255, .78);  --bot-edge: rgba(150, 125, 98, .40);
+  --bot-eye: #2B2622;  --bot-blush: rgba(226, 132, 118, .34);
   --sky: #CDE5F4;  --cloud: #FFFFFF;  --h1: #8DBB6E;  --h2: #6BA45C;  --h3: #4F8F4F;  --flower: #E9A3B4;
 
   --raise:    8px 8px 20px var(--sh-d), -8px -8px 20px var(--sh-l);
@@ -42,7 +45,7 @@
     --ink: #EDE9E3; --ink-2: #A39C93; --line: #3A3D44;
     --good: #7ED6A0; --good-soft: #223A2D; --bad: #FF9A82; --bad-soft: #40241F; --warn: #E9BE63; --warn-soft: #3A3014;
     --cta-bg: #EDE9E3; --cta-fg: #1B1816; --focus: #8FB0FF;
-    --orb-ok: #3F9B66; --orb-bad: #D45A41; --orb-warn: #D29A32;
+    --bot-hi: #F2EADB; --bot-mid: #E5DAC8; --bot-lo: #C9BBA5; --bot-lit: rgba(255, 255, 255, .34); --bot-edge: rgba(0, 0, 0, .42);
     --sky: #2F4160; --cloud: #5A6C8C; --h1: #46745A; --h2: #356148; --h3: #2A4E3A; --flower: #C98497;
     color-scheme: dark;
   }
@@ -52,7 +55,7 @@
   --ink: #EDE9E3; --ink-2: #A39C93; --line: #3A3D44;
   --good: #7ED6A0; --good-soft: #223A2D; --bad: #FF9A82; --bad-soft: #40241F; --warn: #E9BE63; --warn-soft: #3A3014;
   --cta-bg: #EDE9E3; --cta-fg: #1B1816; --focus: #8FB0FF;
-  --orb-ok: #3F9B66; --orb-bad: #D45A41; --orb-warn: #D29A32;
+  --bot-hi: #F2EADB; --bot-mid: #E5DAC8; --bot-lo: #C9BBA5; --bot-lit: rgba(255, 255, 255, .34); --bot-edge: rgba(0, 0, 0, .42);
   --sky: #2F4160; --cloud: #5A6C8C; --h1: #46745A; --h2: #356148; --h3: #2A4E3A; --flower: #C98497;
   color-scheme: dark;
 }
@@ -258,75 +261,102 @@
     .seg button { padding-inline: 14px; }
   }
 
-  /* ---- 8. The bot (behavior lives in bot.js; state lives in data-state on #bots) ---- */
+  /* ---- 8. The bot: a cream rubber ball made of the same material as the tiles ----
+     Behavior lives in bot.js. It sets data-state on #bots (idle, checking, pass, fail, cantrun) and the
+     --gx / --gy gaze variables, so those names and the hop keyframes must stay. The body never changes color;
+     the state shows in the eyes, the cheeks and the dot in the speech bubble. */
   .bots-wrap {
     position: fixed; z-index: 10; right: 12px;
     bottom: calc(var(--dock-h) + 10px + env(safe-area-inset-bottom, 0px));
     display: flex; flex-direction: column; align-items: flex-end; gap: 10px;
   }
   .buddy {
-    --c: var(--orb-ok); --tx: var(--good);
+    --eye: var(--bot-eye);  --blush: var(--bot-blush);  --tx: var(--ink-2);
+    --orb-in: inset -6px -7px 12px var(--bot-edge), inset 5px 6px 10px var(--bot-lit);   /* rubber turning away from the light */
     --gx: 0; --gy: 0;
     display: flex; align-items: center; gap: 14px;
   }
-  .buddy[data-state="fail"]    { --c: var(--orb-bad);  --tx: var(--bad); }
-  .buddy[data-state="cantrun"] { --c: var(--orb-warn); --tx: var(--warn); }
+  .buddy[data-state="pass"]    { --eye: #1F6B3F; --tx: var(--good); --blush: rgba(226, 132, 118, .30); }
+  .buddy[data-state="fail"]    { --eye: #B03A20; --tx: var(--bad);  --blush: rgba(214, 96, 76, .50); }
+  .buddy[data-state="cantrun"] { --eye: #8A5A00; --tx: var(--warn); --blush: rgba(221, 168, 70, .42); }
 
   .bubble {
-    width: 208px; min-height: 46px; padding: 10px 14px; position: relative;
-    background: var(--bg); border-radius: 18px; box-shadow: var(--raise-sm);
-    color: var(--tx); font: 500 .95rem/1.25 var(--font);
+    width: 208px; min-height: 46px; padding: 10px 14px 10px 32px; position: relative;
+    background: var(--bg); border-radius: 20px; box-shadow: var(--raise-sm);
+    color: var(--ink); font: 500 .92rem/1.3 var(--font);
     opacity: 0; transform: translateX(8px) scale(.96); pointer-events: none;
-    transition: opacity .25s, transform .35s cubic-bezier(.3, 1.4, .5, 1), color .4s;
+    transition: opacity .25s, transform .35s cubic-bezier(.3, 1.4, .5, 1);
   }
   .bubble.show { opacity: 1; transform: none; }
-  .bubble::after {  /* tail pointing at the orb */
+  .bubble::before {  /* the state dot: the text stays ink-dark so it is always readable */
+    content: ""; position: absolute; left: 14px; top: 50%; width: 9px; height: 9px; margin-top: -4.5px;
+    border-radius: 50%; background: var(--tx); transition: background-color .4s;
+  }
+  .bubble::after {   /* tail pointing at the ball */
     content: ""; position: absolute; right: -6px; top: 50%; width: 12px; height: 12px; margin-top: -6px;
     background: var(--bg); transform: rotate(45deg); border-radius: 2px; box-shadow: 3px -3px 5px var(--sh-d);
   }
-  @media (max-width: 520px) { .bubble { width: 160px; } }
+  @media (max-width: 520px) { .bubble { width: 168px; } }
 
-  .buddy-orb { position: relative; width: 56px; height: 56px; flex: none; cursor: pointer; }
+  .buddy-orb { position: relative; width: 60px; height: 60px; flex: none; cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .orb {
-    position: absolute; inset: 0; border-radius: 50%; background: var(--c); overflow: hidden;
-    box-shadow: 5px 5px 12px var(--sh-d), -5px -5px 12px var(--sh-l);
-    transform: translate(calc(var(--gx) * .35px), calc(var(--gy) * .35px));  /* body leans toward the gaze */
-    transition: transform .55s cubic-bezier(.25, .8, .25, 1), background-color .5s;
+    position: absolute; inset: 0; border-radius: 50%; overflow: hidden;
+    background: radial-gradient(circle at 34% 26%, var(--bot-hi) 0, var(--bot-mid) 46%, var(--bot-lo) 100%);
+    box-shadow: 7px 7px 16px var(--sh-d), -7px -7px 16px var(--sh-l), var(--orb-in);   /* raised off the page like a tile */
+    transform: translate(calc(var(--gx) * .35px), calc(var(--gy) * .35px));            /* body leans toward the gaze */
+    transition: transform .55s cubic-bezier(.25, .8, .25, 1), box-shadow .2s;
   }
-  .orb::before {  /* soft highlight and edge shading */
+  /* pressed like rubber: it squashes and sinks */
+  .buddy-orb:active .orb {
+    transform: translate(calc(var(--gx) * .35px), calc(var(--gy) * .35px)) scale(.93, .89);
+    box-shadow: 3px 3px 8px var(--sh-d), -3px -3px 8px var(--sh-l), var(--orb-in);
+    transition-duration: .12s;
+  }
+  .orb::before {  /* a soft wide sheen, not a glass glint, and a fine speckle so it reads as matte rubber */
     content: ""; position: absolute; inset: 0; border-radius: 50%;
     background:
-      radial-gradient(circle at 32% 20%, rgba(255, 255, 255, .55) 0, rgba(255, 255, 255, 0) 42%),
-      radial-gradient(circle at 50% 118%, rgba(255, 255, 255, .35) 0, rgba(255, 255, 255, 0) 55%),
-      radial-gradient(circle at 50% 50%, transparent 55%, rgba(40, 20, 10, .25) 100%);
+      radial-gradient(ellipse 40% 26% at 33% 20%, rgba(255, 255, 255, .62), rgba(255, 255, 255, 0) 72%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='90' height='90'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .42 0 0 0 0 .34 0 0 0 0 .26 0 0 0 .34 0'/%3E%3C/filter%3E%3Crect width='90' height='90' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: auto, 90px 90px;
   }
+  .orb::after {   /* cheeks */
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+    background:
+      radial-gradient(circle 7px at 23% 63%, var(--blush), transparent),
+      radial-gradient(circle 7px at 77% 63%, var(--blush), transparent);
+    transition: opacity .4s;
+  }
+
   .eyes {
-    position: absolute; left: 50%; top: 44%; display: flex; gap: 10px;
+    position: absolute; left: 50%; top: 44%; display: flex; gap: 11px;
     transform: translate(-50%, -50%) translate(calc(var(--gx) * 1px), calc(var(--gy) * 1px));
     transition: transform .5s cubic-bezier(.25, .8, .25, 1), gap .35s;
   }
   .eye {
-    width: 6px; height: 14px; border-radius: 6px; background: #fff; box-sizing: border-box;
+    position: relative; width: 6px; height: 14px; border-radius: 6px; background: var(--eye); box-sizing: border-box;
     transform: rotate(var(--tilt, 8deg)) scaleY(var(--b, 1));
     transition: transform .1s ease-out, width .35s, height .35s, border-radius .35s, background-color .3s, border-color .3s;
   }
+  .eye::after { content: ""; position: absolute; top: 2px; left: 1px; width: 2px; height: 2px; border-radius: 50%; background: rgba(255, 255, 255, .8); }
   .eye:nth-child(1) { --tilt: -8deg; }
   .buddy.blink { --b: .12; }
 
-  /* expressions */
-  .buddy[data-state="pass"] .eyes { gap: 8px; }
-  .buddy[data-state="pass"] .eye { --tilt: 0deg; width: 14px; height: 7px; background: transparent; border-top: 4px solid #fff; border-radius: 14px 14px 0 0; }
+  /* expressions: happy arcs, angry slants, flat sleepy slits */
+  .buddy[data-state="pass"] .eyes { gap: 9px; }
+  .buddy[data-state="pass"] .eye { --tilt: 0deg; width: 14px; height: 7px; background: transparent; border-top: 4px solid var(--eye); border-radius: 14px 14px 0 0; }
+  .buddy[data-state="pass"] .eye::after { display: none; }
   .buddy[data-state="fail"] .eye { height: 20px; }
   .buddy[data-state="fail"] .eye:nth-child(1) { --tilt: 14deg; }
   .buddy[data-state="fail"] .eye:nth-child(2) { --tilt: -14deg; }
-  .buddy[data-state="cantrun"] .eyes { gap: 7px; }
+  .buddy[data-state="cantrun"] .eyes { gap: 8px; }
   .buddy[data-state="cantrun"] .eye { --tilt: 0deg; width: 15px; height: 5px; border-radius: 5px; }
+  .buddy[data-state="cantrun"] .eye::after { display: none; }
 
-  /* body motion */
-  @keyframes bob   { 0%, 100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-3px) scale(1.025); } }
-  @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.07); } }
-  @keyframes hop   { 0% { transform: translateY(0) scale(1); } 20% { transform: translateY(2px) scale(1.08, .9); }
-                     55% { transform: translateY(-12px) scale(.94, 1.08); } 80% { transform: translateY(0) scale(1.06, .94); } 100% { transform: none; } }
+  /* body motion: it squashes and stretches like something soft */
+  @keyframes bob   { 0%, 100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-3px) scale(1.025, .985); } }
+  @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.07, .96); } }
+  @keyframes hop   { 0% { transform: translateY(0) scale(1); } 20% { transform: translateY(2px) scale(1.1, .88); }
+                     55% { transform: translateY(-12px) scale(.93, 1.09); } 80% { transform: translateY(0) scale(1.07, .93); } 100% { transform: none; } }
   @keyframes shake { 0%, 100% { transform: none; } 20% { transform: translateX(-4px); } 40% { transform: translateX(4px); } 60% { transform: translateX(-3px); } 80% { transform: translateX(3px); } }
   .buddy[data-state="idle"] .buddy-orb,
   .buddy[data-state="cantrun"] .buddy-orb { animation: bob 4s ease-in-out infinite; }
