@@ -98,10 +98,13 @@ function buildLintConfig(sourceType, extraGlobals) {
 }
 
 function toFinding(message) {
+  const hint = message.ruleId === "no-undef"
+    ? ` If it comes from a library you load on your page, add "${/'([^']+)'/.exec(message.message)?.[1] ?? "the name"}" to Extra names.`
+    : "";
   return {
     line: message.line,
     column: message.column,
-    message: message.message,
+    message: message.message + hint,
     ruleId: message.ruleId,
     severity: message.severity === 2 ? "error" : "note",
   };
@@ -162,10 +165,22 @@ const PAGE_ONLY_NAMES = new Set(["document", "window", "localStorage", "sessionS
 function workerSetup(blockedNames, maxTimerWaitMs) {
   const send = (message) => self.postMessage(message);
 
+  // JSON.stringify turns NaN and Infinity into null and drops undefined, which would hide exactly the values a bug produces
+  const readable = (key, value) => {
+    if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+    if (typeof value === "bigint") return `${value}n`;
+    if (typeof value === "undefined") return "undefined";
+    if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`;
+    if (value instanceof Map) return { Map: [...value] };
+    if (value instanceof Set) return { Set: [...value] };
+    if (value instanceof Error) return `${value.name}: ${value.message}`;
+    return value;
+  };
   const describe = (value) => {
     if (typeof value === "string") return value;
     if (value instanceof Error) return `${value.name}: ${value.message}`;
-    try { return JSON.stringify(value) ?? String(value); } catch { return String(value); }
+    if (typeof value !== "object" && typeof value !== "function") return String(value);
+    try { return JSON.stringify(value, readable) ?? String(value); } catch { return String(value); }
   };
   self.zappleDescribe = describe;   // used by the generated check code
 
@@ -689,6 +704,10 @@ const NEWER_BUILT_IN_MEMBERS = new Set([
 const BUILT_IN_NAMESPACES = ["Math", "JSON", "Object", "Array", "Number", "String", "Promise", "Symbol", "Date", "Boolean"];
 const INSTANCE_PROTOTYPES = { Array, String, Number, Map, Set };
 
+const MAX_PROPERTY_POOL = 40;   // property-typo guesses only run on snippet-sized code (at most this many distinct own property names)
+const BUILT_IN_PROPERTY_NAMES = new Set([Object, Function, Array, String, Number, Boolean, Map, Set, WeakMap, Promise, Date, RegExp, Error, Symbol]
+  .flatMap((type) => [...Object.getOwnPropertyNames(type), ...Object.getOwnPropertyNames(type.prototype)]));
+
 function namesOf(object) {
   const names = new Set();
   for (let current = object; current && current !== Object.prototype; current = Object.getPrototypeOf(current)) {
@@ -755,6 +774,7 @@ function analyzeStructure(code, sourceType) {
     newCalls: [],                // new X() calls
     otherCalls: [],              // calls that can only be traced by guessing
     unawaitedCalls: [],          // candidates: async functions called and dereferenced (judged in findStructureProblems)
+    propertyTypos: [],           // item.quantitty when the code itself defines "quantity" (a note, never an error)
     builtInTypos: [],            // Math.flor, "abc".toUppercase(): members that do not exist on a built-in
     loopInvariants: [],          // while loops whose conditions are never mutated
     loopShadowing: [],           // nested loops that reuse the same index variable
@@ -773,6 +793,8 @@ function analyzeStructure(code, sourceType) {
   const memberUses = [];                // obj.member reads and calls, judged after the whole code was read
   const quietMembers = new Set();       // member expressions that are tested for, assigned or deleted: never reported
   const testedNames = new Set();        // member names that are tested for or written as text anywhere (feature detection)
+  const definedProps = new Set();       // property names the code itself creates (object keys, class members, this.x =, obj.x =)
+  const propReads = [];                 // obj.prop reads, judged against definedProps at the end
   const assignedMembers = new Set();    // "String.alphabet": members the code adds itself, so they are real
   const calledMembers = new Set();      // member expressions that are the callee of a call
 
@@ -913,6 +935,13 @@ function analyzeStructure(code, sourceType) {
       if (member?.type === "MemberExpression" && !member.computed && member.property.type === "Identifier") testedNames.add(member.property.name);
     };
     if (node.type === "Literal" && typeof node.value === "string") testedNames.add(node.value);
+    if ((node.type === "Property" || node.type === "MethodDefinition" || node.type === "PropertyDefinition") && !node.computed) {
+      if (node.key.type === "Identifier") definedProps.add(node.key.name);
+      else if (node.key.type === "Literal" && typeof node.key.value === "string") definedProps.add(node.key.value);
+    }
+    if (node.type === "MemberExpression" && !node.computed && node.property.type === "Identifier" && !node.optional) {
+      propReads.push({ ...whereOf(node), name: node.property.name, quiet: () => quietMembers.has(node) });
+    }
     if (node.type === "UnaryExpression" && (node.operator === "typeof" || node.operator === "delete" || node.operator === "!")) quiet(node.argument);
     else if (node.type === "LogicalExpression") { quiet(node.left); quiet(node.right); }
     else if (node.type === "IfStatement" || node.type === "ConditionalExpression") quiet(node.test);
@@ -923,6 +952,7 @@ function analyzeStructure(code, sourceType) {
 
     if (node.type === "AssignmentExpression") {
       writtenNames(node.left).forEach((name) => writtenTo.add(name));
+      if (node.left.type === "MemberExpression" && !node.left.computed && node.left.property.type === "Identifier") definedProps.add(node.left.property.name);
       if (node.left.type === "MemberExpression" && !node.left.computed && node.left.property.type === "Identifier") assignedMembers.add(node.left.property.name);
     }
     else if (node.type === "UpdateExpression") writtenNames(node.argument).forEach((name) => writtenTo.add(name));
@@ -970,6 +1000,27 @@ function analyzeStructure(code, sourceType) {
         property: use.property, typeLabel, called: use.called,
         suggestion: closestName(use.property, members) && (typeLabel.startsWith("JavaScript's") ? `${label}.` : "") + closestName(use.property, members),
       });
+    }
+  }
+
+  /**
+   * A property read that appears once, never gets created, and is one or two letters off a name this same code defines and
+   * uses repeatedly. That pattern is how a typo looks (item.quantitty beside {quantity}); property names that come from outside
+   * (a server response, an AST, a library object) normally repeat or have no close twin, so they stay quiet.
+   */
+  function judgePropertyTypos() {
+    const reported = new Set(structure.builtInTypos.map((typo) => `${typo.line}:${typo.column}`));
+    const useCounts = new Map();
+    for (const read of propReads) useCounts.set(read.name, (useCounts.get(read.name) ?? 0) + 1);
+    const defined = [...definedProps].filter((name) => name.length >= 5);
+    if (defined.length > MAX_PROPERTY_POOL) return;   // in big code the pool of names is large and outside names often resemble them
+    const pluralPair = (a, b) => a + "s" === b || b + "s" === a || a + "es" === b || b + "es" === a;   // schema / schemas are two real names, not a typo
+    for (const read of propReads) {
+      if (read.name.length < 5 || useCounts.get(read.name) !== 1 || definedProps.has(read.name) || BUILT_IN_PROPERTY_NAMES.has(read.name)
+          || read.quiet() || testedNames.has(read.name) || NEWER_BUILT_IN_MEMBERS.has(read.name) || reported.has(`${read.line}:${read.column}`)) continue;
+      const near = defined.find((name) => name.toLowerCase() !== read.name.toLowerCase() && name[0].toLowerCase() === read.name[0].toLowerCase()
+        && editDistance(read.name, name) <= 2 && !pluralPair(read.name, name) && !BUILT_IN_PROPERTY_NAMES.has(name));
+      if (near) structure.propertyTypos.push({ line: read.line, column: read.column, owner: read.owner, name: read.name, suggestion: near });
     }
   }
 
@@ -1059,6 +1110,7 @@ function analyzeStructure(code, sourceType) {
   });
 
   judgeMemberUses();
+  judgePropertyTypos();
   structure.bindingCounts = bindingCounts;
   return structure;
 }
@@ -1096,6 +1148,7 @@ function findStructureProblems({
   asyncFunctions = new Set(),
   bindingCounts = new Map(),
   builtInTypos = [],
+  propertyTypos = [],
 }) {
   const errors = [];
   const notes = [];
@@ -1179,6 +1232,15 @@ function findStructureProblems({
       `${typo.text}${typo.called ? "()" : ""} does not exist: ${typo.typeLabel} has no "${typo.property}".${hint}`,
       "zapple/unknown-builtin-member",
       "error"
+    ));
+  }
+
+  for (const typo of propertyTypos) {
+    notes.push(structureFinding(
+      typo,
+      `".${typo.name}" is read here, but nothing in this code ever creates it. Did you mean ".${typo.suggestion}"? (Zapple only guesses when the name is one or two letters off a name your code defines.)`,
+      "zapple/possible-property-typo",
+      "note"
     ));
   }
 
