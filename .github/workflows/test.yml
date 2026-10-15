@@ -1,0 +1,40 @@
+name: Test checks.js
+
+# Runs the Zapple test suite on every push and pull request. It does not change the website:
+# GitHub Pages keeps serving the same files. Open the Actions tab to see results.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"      # the version Pyodide runs in the browser
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Install dependencies
+        run: |
+          npm install --no-audit --no-fund
+          python -m pip install -r requirements-test.txt
+          python -m playwright install --with-deps chromium
+
+      - name: JavaScript checks (acorn + ESLint)
+        run: npm run test:js
+
+      - name: Python checks (real pyflakes)
+        run: npm run test:py
+
+      - name: Sandbox in a real browser (Chromium)
+        run: npm run test:sandbox
