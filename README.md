@@ -1,126 +1,141 @@
-# Zapple
-
-Zapple checks AI-written JavaScript **before** you use it, entirely in your browser.
-
-Commercial AI tools make mistakes, and every failed run costs another prompt against your rate limit.
-Zapple catches those mistakes first and gives you **one** repair prompt that lists everything wrong, so the AI can fix it in a single reply.
-
-## How to use it
-
-1. Paste the code the AI gave you.
-2. Choose the language. For JavaScript, Zapple works out by itself whether the code is a module (uses `import`/`export`) or a plain script, and says which in the log.
-3. Optionally describe what the code should do, and list names it may use from libraries you load (for example `THREE`).
-4. Tap **Check**.
-5. If problems are found, tap **Copy repair prompt** and send it to the AI.
-6. Open the **Log** panel to see exactly what Zapple did, step by step.
-
-## What it checks
-
-Each stage runs only if the one before it passes.
-
-| Stage | Question it answers | Tool |
-|---|---|---|
-| 1. Syntax | Is this valid JavaScript? | [acorn](https://github.com/acornjs/acorn) |
-| 2. Rules | Does it use names that don't exist, reassign constants, use a variable before it is declared, contain unreachable code, and so on? All findings are reported at once. | [ESLint](https://eslint.org) (browser build) |
-| 3. Structure | Are functions called with the wrong number of arguments? Does `this.method()` point at a method the class doesn't have? Also produces a text call map. | Zapple's own reader of the syntax tree (acorn) |
-| 4. Test run | Does it crash when it runs? Does it loop forever? Do your own checks (for example `add(2, 3) === 5`) pass? | Web Worker sandbox |
-
-Too many arguments and unknown `this.methods` are errors. Too few arguments is only a note, because leaving one out is sometimes intentional.
-
-Minor findings (like unused variables) are shown on screen but left out of the repair prompt, so the AI is not asked to tidy code you didn't ask about.
-
-## Architecture
-
-Zapple is a static site with no server and no build step. Everything runs on the visitor's device.
-
-```
-paste code
-   |
-   v
-[1 Syntax check]  --error-->  repair prompt (one error, with surrounding lines)
-   | ok
-   v
-[2 Rule check]    --errors-->  repair prompt (every error, with its line)
-   | ok
-   v
-[3 Sandbox run]   --crash-->   repair prompt (runtime error mapped to your line)
-   | ok
-   v
-OK + console output
-```
-
-`index.html` is one file, organized in labeled sections:
-
-| Section | Job |
-|---|---|
-| Environment snapshot | Records the names this browser provides (`document`, `fetch`, ...) before any library loads, so ESLint doesn't call them undefined |
-| Log | Timestamped record of each step |
-| Rule checks | Syntax check, ESLint rule set, finding format |
-| Sandbox | Runs the code in a Web Worker and reports crashes, timeouts and console output |
-| Repair prompt | Builds the prompt from any set of findings |
-| Display | Turns results into screen elements (pasted code is never inserted as HTML) |
-| Wiring | Connects the buttons to the flow above |
-
-The checking and prompt-building sections contain no DOM code, so they can move into their own modules later without changes.
-
-All stages produce the same **finding** shape (`line`, `column`, `message`, `ruleId`, `severity`), which is why one prompt builder and one results list serve every stage.
-
-## The sandbox
-
-Code is test-run in a Web Worker: a separate background thread with no access to the page.
-
-- **Time limit:** 3 seconds to reach the last line. After that the worker is stopped and reported as a possible infinite loop. After the last line, Zapple waits half a second for delayed errors from timers and promises.
-- **Blocked, in both JavaScript and Python:** `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `importScripts`, `indexedDB`, and `caches`. Using one is reported as a crash. Python needs the network while it loads, so these are switched off once loading is finished, before any of your code runs. That also stops code that reaches them through the browser bridge (for example `from js import fetch`).
-- **Captured:** `console.log`, `info`, `warn`, `error` and `debug`, shown on screen and in the log.
-- **Line numbers:** crash locations are mapped back to your code from the error's stack trace. Browsers format traces differently, so some crashes are reported without a line.
-
-This protects against accidents such as runaway loops and stray network calls. It is not designed to contain hostile code. One more limit worth knowing: every project hosted under the same GitHub Pages address (for example `yourname.github.io`) counts as one website to the browser and shares the same stored data. The block above keeps test code away from that data, but the safest setup is to host Zapple at its own address.
-
-**Size limit:** pasted code over 200,000 characters (roughly 5,000 lines) is refused with an explanation, because the checks run inside the page and a very large paste can freeze it. Check one part at a time instead.
-
-### What is not test-run yet
-
-- Code that uses the page (`document`, `window`, `localStorage`, `alert`, ...), because a worker has no page.
-- Code that uses `import`.
-
-Zapple says so when it skips a run. It also only tests what actually executes: a function that nothing calls cannot fail.
-
-## Python
-
-Choosing Python runs three of the four stages:
-
-1. **Syntax:** Python's own parser.
-2. **Rules:** [pyflakes](https://github.com/PyCQA/pyflakes) reports undefined names, unused imports and similar problems, all at once.
-3. **Test run:** the code runs inside a background worker with the same 3-second limit, and your Checks run afterwards.
-
-Python runs through [Pyodide](https://pyodide.org), Python compiled to work inside the browser. It loads only when Python is chosen (about 10 MB the first time, cached afterwards) and stays loaded between checks. If code runs past the time limit, Python is stopped and restarts on the next check.
-
-- **Notebook lines** such as `!pip install x` or `%matplotlib inline` are not Python. Zapple replaces each with `pass`, so line numbers stay correct, and notes it in the log.
-- **Names from earlier notebook cells** can be listed in the "Extra names" box so they are not reported as undefined.
-- **Standard library only:** code that imports packages such as torch, transformers or numpy still gets the syntax and rule checks, but the test run is skipped, and Zapple explains why.
-- **Structure checks** work for Python too: wrong argument counts (positional, keyword, missing), unknown `self.method()` calls, constructor calls checked against `__init__`, mutable default values, and a call map. Links in the call map that Zapple can only guess (an object's method found in exactly one class) end in `?`.
-- **Browser limits:** `asyncio.run(...)` at the top level is run as `await ...`, because the browser's Python already has an event loop. Code that starts threads cannot run in a browser, so it is reported as "not test-run" instead of as a crash.
-
-## Dependencies
-
-Loaded from a CDN when needed (a connection is required the first time):
-
-- acorn 8.11.3
-- eslint-linter-browserify 9.37.0 (exposes the global `eslint`)
-- Pyodide 0.26.4, and pyflakes (installed inside Pyodide), only when Python is chosen
-
-## Run or deploy
-
-Serve the folder from any static host. On GitHub Pages: repository Settings, Pages, deploy from the branch, and open the site URL. `index.html` is served at the root.
-
-## Roadmap
-
-- [x] Syntax check
-- [x] Repair prompt
-- [x] Rule checks (ESLint)
-- [x] Sandbox test run and log
-- [x] Structure checks, text call map, and user-written checks
-- [x] Python syntax, rule checks and test run (standard library only)
-- [x] Python structure checks (argument counts, call map)
-- [ ] Optional remote runner for heavy libraries such as torch and transformers
-- [ ] Optional small ONNX models (routing, error classification)
+Zapple
+Check AI-generated JavaScript and Python before you use it. Zapple runs in your browser, finds likely problems, and helps you send the AI a focused repair prompt instead of spending another prompt debugging one error at a time.
+Zapple combines syntax validation, static analysis, structural checks, and a sandboxed test run where the code can be executed safely enough for ordinary debugging. It also provides a log and a copyable repair prompt.
+Important: Zapple is a debugging aid, not a proof that code is correct or a security boundary for hostile code. A passing check only means the tested checks passed in the conditions available to Zapple.
+How to use it
+Paste the code you want to check.
+Choose JavaScript or Python.
+Optionally describe what the code should do and list names it is expected to use from libraries or earlier notebook cells (for example, THREE).
+Tap Check.
+Review the findings, call map, console output, and Log.
+If Zapple finds problems, tap Copy repair prompt and send that prompt to your AI assistant.
+Make the suggested changes, then check the revised code again.
+For JavaScript, Zapple detects whether the code should be parsed as a script or a module based on import/export syntax. Module parsing does not mean every module can be executed in the sandbox; see the limitations below.
+What Zapple checks
+Zapple runs the checks supported for the selected language. Some later stages may be skipped when the browser environment cannot verify the code.
+Stage
+What it checks
+JavaScript
+Python
+1. Syntax
+Invalid syntax and parse errors
+Yes
+Yes
+2. Rules
+Issues such as undefined names and other static-analysis findings
+ESLint browser build
+Pyflakes
+3. Structure
+Function/method calls, argument counts, selected class/constructor relationships, and a text call map
+Yes
+Yes
+4. Test run
+Runtime errors, console output, timeouts, and user-written checks where supported
+Web Worker sandbox
+Pyodide in the browser
+Structural checks
+Zapple's structure analysis reads the syntax tree to find likely call-site problems that syntax and lint rules may not catch.
+Examples include:
+Too many arguments passed to a function.
+Calls to unknown this.method() or self.method() names in supported patterns.
+Python constructor calls checked against __init__.
+Python calls with missing or unexpected positional/keyword arguments.
+Python mutable default values.
+A text call map that helps show how functions are connected.
+Too few JavaScript arguments may be reported as a note rather than an error because omitted arguments can be intentional. Some inferred object-method relationships are uncertain and are marked with ?.
+User-written checks
+You can write simple checks for expected results, such as:
+add(2, 3) === 5
+Zapple can evaluate these checks after the supported test run. A failed check is reported as a finding; it is not the same thing as a syntax error. Checks can only validate behavior that the sandbox can actually execute and observe.
+Findings and repair prompts
+Findings use a common format, including location and message where available.
+Zapple can report multiple rule or structure findings together.
+Minor findings, such as unused variables, may be shown on screen but omitted from the repair prompt so the AI is not asked to make unrelated cleanups.
+The Log records what Zapple did step by step.
+Captured console output helps show what happened during a test run.
+JavaScript sandbox
+JavaScript is executed in a Web Worker, separate from the page's main JavaScript context.
+The sandbox currently provides:
+A time limit for code execution to help detect infinite loops or code that does not finish.
+Captured console.log, console.info, console.warn, console.error, and console.debug output.
+Runtime error reporting, with line numbers mapped back to user code when the browser's stack trace provides enough information.
+Handling for timers and delayed work, including cases where a continuing timer means Zapple cannot confidently verify a result.
+User-written checks for expected values.
+A “could not verify”/skipped result for certain unsupported browser features or environment limitations, rather than treating every limitation as a bug.
+JavaScript limitations
+The sandbox is not a full browser page and does not reproduce every application environment.
+Code that depends on page objects such as document, window, localStorage, or alert generally cannot be tested as if it were running in a real page.
+import/export can affect how code is parsed, but imported dependencies are not automatically fetched and wired into the sandbox. Module code that depends on external imports may therefore not be test-runnable.
+Network and browser storage APIs are restricted in the sandbox, including fetch, XMLHttpRequest, WebSocket, EventSource, importScripts, indexedDB, and caches. Depending on the code path, Zapple may report that it cannot verify the run.
+Code that never calls a function cannot reveal that function's runtime errors during the test run.
+Browser stack traces differ, so some runtime errors may not have a reliable user-code line number.
+The sandbox is designed to help test ordinary pasted code, not to contain hostile or deliberately malicious code.
+Size limit: pasted code over 200,000 characters (roughly 5,000 lines) is refused because very large input can freeze the page. Check a smaller section at a time.
+Python support
+Python runs in the browser through Pyodide, a Python runtime compiled to WebAssembly.
+Zapple's Python checks include:
+Python syntax parsing.
+Static analysis with Pyflakes, including undefined names and unused imports.
+Structure checks for supported function and method calls, argument counts, constructors, mutable defaults, and a text call map.
+A sandboxed test run with a time limit.
+User-written checks after the code runs, where supported.
+Console/log output and explanatory messages when a run cannot be verified.
+Python limitations
+Pyodide loads when Python is selected; the first load requires a network connection and may take time. Browser caching can make later loads faster.
+The browser runtime does not provide every package or system feature available in desktop Python.
+Code that imports packages unavailable in the browser (for example, heavy packages such as torch or transformers) may still receive syntax, rule, and structure checks, while the runtime test is skipped.
+Notebook commands such as !pip install ... and %matplotlib inline are not standard Python. Zapple replaces supported notebook-style lines with pass to preserve line numbering and notes this in the log.
+Names from earlier notebook cells can be listed in the Extra names field to avoid false undefined-name findings.
+Because the browser's Python already has an event loop, top-level asyncio.run(...) is handled as await ... where supported.
+Code that starts threads cannot run normally in this browser environment and may be marked as not test-run.
+Network access is restricted during the user's code execution. Pyodide may need network access to load before the restrictions are applied.
+Privacy, safety, and browser limits
+Zapple is a static browser application; the checking flow is designed to run on the visitor's device. It does not need a Zapple application server to perform its local checks. Some libraries and the Python runtime are loaded from a CDN, so a connection is needed when they are first downloaded.
+The sandbox helps prevent ordinary test code from making network requests or running indefinitely, but it is not a security sandbox for untrusted or hostile programs. Do not use it as a guarantee that malicious code is harmless.
+Browser storage is scoped by the website origin. Sites or projects hosted under the same origin may share browser storage, so hosting Zapple at a dedicated origin is preferable if origin isolation matters.
+Dependencies
+The README's current implementation uses these browser-loaded dependencies:
+Acorn for JavaScript parsing (version 8.11.3).
+ESLint through eslint-linter-browserify (version 9.37.0).
+Pyodide (version 0.26.4) and Pyflakes for Python support.
+Python support loads only when selected. The first load may be around 10 MB, depending on what is cached and how the runtime is delivered.
+Automated tests
+The repository includes automated JavaScript, Python, and browser sandbox tests run through GitHub Actions. The workflow installs its test dependencies and runs the checks, including the sandbox suite in Chromium.
+A successful workflow means the tests in that run passed against that commit. It does not guarantee that every possible program or environment has been tested.
+Run or deploy
+Zapple is a static site and does not require an application server or build step.
+To deploy with GitHub Pages:
+Open the repository's Settings.
+Open Pages.
+Configure deployment from the branch and folder containing the site files.
+Save the settings and open the published site URL.
+Serve the site from any compatible static host. Keep the expected app files at the location configured for your host; index.html is served at the site root when the repository is configured that way.
+Current capabilities and roadmap
+Available now
+[x]
+JavaScript syntax checks
+[x]
+JavaScript static analysis with ESLint
+[x]
+JavaScript structure checks and text call map
+[x]
+JavaScript sandbox execution, console capture, and runtime findings
+[x]
+User-written checks for expected results
+[x]
+Repair-prompt generation
+[x]
+Python syntax checks
+[x]
+Python static analysis with Pyflakes
+[x]
+Python structure checks and text call map
+[x]
+Python sandbox execution through Pyodide, within browser limits
+[x]
+GitHub Actions CI for JavaScript, Python, and Chromium sandbox tests
+Not available yet / future work
+[ ]
+Optional remote runner for code requiring heavy libraries such as torch and transformers
+[ ]
+Optional small ONNX models for routing or error classification
