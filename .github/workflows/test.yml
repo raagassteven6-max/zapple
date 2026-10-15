@@ -1,5 +1,3 @@
-name: Test checks.js
-
 # Runs the Zapple test suite on every push and pull request. It does not change the website:
 # GitHub Pages keeps serving the same files. Open the Actions tab to see results.
 on:
@@ -16,7 +14,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
       - uses: actions/setup-python@v5
         with:
