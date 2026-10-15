@@ -1,0 +1,15 @@
+{
+  "name": "zapple-checks-tests",
+  "private": true,
+  "description": "Test suite for checks.js (not part of the published site)",
+  "scripts": {
+    "test:js": "node --test tests/test_js.js",
+    "test:sandbox": "python3 tests/test_sandbox.py",
+    "test:py": "python3 tests/test_py.py",
+    "test": "npm run test:js && npm run test:py && npm run test:sandbox"
+  },
+  "devDependencies": {
+    "acorn": "8.11.3",
+    "eslint": "9.37.0"
+  }
+}
