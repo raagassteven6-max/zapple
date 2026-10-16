@@ -234,6 +234,13 @@
   /* ---- 6. Log ---- */
   .log-output { max-height: 60vh; overflow: auto; margin: 14px 0 0; font-size: .8rem; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); }
 
+  .history { display: grid; gap: 14px; margin-top: 20px; }
+  .history h2 { margin: 0; }
+  .switch-row { display: flex; align-items: center; gap: 12px; min-height: 44px; font-size: .95rem; cursor: pointer; }
+  .switch-row input { width: 22px; height: 22px; flex: none; accent-color: var(--good); }
+  .history .row { display: flex; flex-wrap: wrap; gap: 12px; }
+  .history .btn:disabled { opacity: .5; box-shadow: var(--inset); cursor: default; }
+
   /* ---- 7. Bottom dock: tabs and the black pill ---- */
   .dock {
     position: fixed; z-index: 20; bottom: 0; left: 50%; translate: -50% 0;

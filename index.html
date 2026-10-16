@@ -124,6 +124,20 @@
           <p class="hint">Behind the scenes, in order.</p>
           <pre id="log-output" class="code-frame log-output">Nothing has run yet.</pre>
         </div>
+
+        <div class="card history">
+          <h2>Saved on this device</h2>
+          <p class="hint" id="history-status">Checking what is saved…</p>
+          <label class="switch-row" for="keep-code">
+            <input type="checkbox" id="keep-code">
+            <span>Also keep my code with each saved check</span>
+          </label>
+          <p class="hint">Off by default. Without it, only what Zapple found is saved, plus a fingerprint of the code.</p>
+          <div class="row">
+            <button type="button" id="export-button" class="btn sm" disabled>Export</button>
+            <button type="button" id="forget-button" class="btn sm" disabled>Delete saved checks</button>
+          </div>
+        </div>
       </section>
     </main>
   </div>

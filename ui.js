@@ -142,7 +142,7 @@ function buildCodeFrame({ line, column, sourceLine }) {
   return el("pre", "code-frame", `${gutter}${sourceLine}\n${caretLine}`);
 }
 
-function showSyntaxError(problem, promptText) {
+function showSyntaxError(problem, promptText, request) {
   const box = el("div", "result error");
   const jumpButton = el("button", "btn sm", `Go to line ${problem.line}`);
   jumpButton.type = "button";
@@ -162,6 +162,7 @@ function showSyntaxError(problem, promptText) {
     tiles: [{ value: 1, sub: "to fix", tone: "bad" }, notReached, notReached],
   });
   botState("fail");
+  saveToHistory(request, [{ ...problem, ruleId: "syntax", severity: "error" }], skippedRun(FIX_FIRST.reason, FIX_FIRST.tip));
   showResult(box, buildPromptSection(promptText));
 }
 
@@ -294,7 +295,7 @@ function buildInsightBox({ errors, notes, run, untraced }) {
 }
 
 /** Shows errors (with the repair prompt), notes, and what the code printed during the test run. */
-function showReport({ errors, notes, callMap, run, promptText, untraced = { count: 0, samples: [] } }) {
+function showReport({ errors, notes, callMap, run, promptText, request, untraced = { count: 0, samples: [] } }) {
   const blocks = [buildInsightBox({ errors, notes, run, untraced })];
 
   if (errors.length === 0) {
@@ -317,6 +318,7 @@ function showReport({ errors, notes, callMap, run, promptText, untraced = { coun
   }
   setSummary(buildReportSummary({ errors, notes, run }));
   botState(errors.length > 0 ? "fail" : run.status === "skipped" ? "cantrun" : "pass");
+  saveToHistory(request, [...errors, ...notes], run);
   showResult(...blocks);
 }
 
@@ -328,6 +330,80 @@ function selectLine(lineNumber) {
   codeInput.focus();
   codeInput.setSelectionRange(start, start + lines[lineNumber - 1].length);
 }
+
+// ---------- Saved history (this device only) ----------
+// Every finished check is saved in this browser's IndexedDB by ZapLog: what was found, why, and
+// whether the next check shows it fixed. Nothing is sent anywhere. The code itself is not saved unless
+// the switch on the Log tab is on. If saving fails (private window, blocked storage), checks still work.
+
+const historyStatus = document.getElementById("history-status");
+const keepCodeSwitch = document.getElementById("keep-code");
+const exportButton = document.getElementById("export-button");
+const forgetButton = document.getElementById("forget-button");
+
+const SESSION_ID = (crypto.randomUUID?.() ?? `s${Date.now().toString(36)}`);
+let checkNumber = 0;
+
+function engineInfo() {
+  return { acorn: typeof acorn !== "undefined" ? acorn.version : null };
+}
+
+/** Saves one finished check. Never throws and never makes the user wait: the report is already on screen. */
+function saveToHistory(request, findings, run) {
+  try {
+    if (!request || typeof ZapLog === "undefined") return;
+    checkNumber += 1;
+    const record = buildLogRecord({
+      language: request.language, sourceType: request.sourceType, code: request.code,
+      findings, run, session: SESSION_ID, seq: checkNumber, engine: engineInfo(),
+    });
+    ZapLog.record(record, request.code).then(refreshHistory);
+  } catch (error) {
+    log.add(`Could not save this check (${error.message}). The result above is not affected`);
+  }
+}
+
+async function refreshHistory() {
+  if (typeof ZapLog === "undefined") return;
+  const stats = await ZapLog.stats();
+  const unavailable = stats === null;
+  exportButton.disabled = unavailable || stats.checks === 0;
+  forgetButton.disabled = unavailable || stats.checks === 0;
+  historyStatus.textContent = unavailable
+    ? "Saving is not available in this browser (a private window can cause this). Checks still work normally."
+    : stats.checks === 0
+      ? "Nothing saved yet. Each check you run will be saved here, on this device only."
+      : `${countLabel(stats.checks, "check")} saved on this device. Nothing is sent anywhere.`;
+}
+
+function readKeepCodeChoice() {
+  try { return localStorage.getItem("zapple-keep-code") === "1"; } catch { return false; }
+}
+
+keepCodeSwitch.checked = readKeepCodeChoice();
+if (typeof ZapLog !== "undefined") ZapLog.setKeepCode(keepCodeSwitch.checked);
+keepCodeSwitch.addEventListener("change", () => {
+  ZapLog.setKeepCode(keepCodeSwitch.checked);
+  try { localStorage.setItem("zapple-keep-code", keepCodeSwitch.checked ? "1" : "0"); } catch { /* the choice just will not be remembered */ }
+});
+
+exportButton.addEventListener("click", async () => {
+  const text = await ZapLog.exportJsonl();
+  if (!text) { flashLabel(exportButton, "Nothing to export"); return; }
+  const link = el("a");
+  link.href = URL.createObjectURL(new Blob([text], { type: "application/x-ndjson" }));
+  link.download = `zapple-log-${new Date().toISOString().slice(0, 10)}.jsonl`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+});
+
+forgetButton.addEventListener("click", async () => {
+  if (!confirm("Delete every saved check on this device? This cannot be undone.")) return;
+  await ZapLog.clear();
+  await refreshHistory();
+});
+
+refreshHistory();
 
 // ---------- Wiring ----------
 
@@ -349,7 +425,7 @@ async function checkPython(request) {
     const seconds = RUN_TIMEOUT_MS / 1000;
     log.add(`Timeout: the code did not finish within ${seconds} s. Python was stopped and restarts on the next check`);
     const errors = [runtimeFinding(`The code did not finish within ${seconds} seconds (possible infinite loop or endless wait)`)];
-    showReport({ errors, notes: [], callMap: "", run: skippedRun(), promptText: buildLintPrompt({ ...request, errors }), untraced: { count: 0, samples: [] } });
+    showReport({ errors, notes: [], callMap: "", run: skippedRun(), promptText: buildLintPrompt({ ...request, errors }), request, untraced: { count: 0, samples: [] } });
     return;
   }
 
@@ -358,7 +434,7 @@ async function checkPython(request) {
   }
   if (analysis.syntax) {
     log.add(`Syntax check: error at line ${analysis.syntax.line}`);
-    showSyntaxError(analysis.syntax, buildSyntaxPrompt({ ...request, problem: analysis.syntax }));
+    showSyntaxError(analysis.syntax, buildSyntaxPrompt({ ...request, problem: analysis.syntax }), request);
     return;
   }
   log.add("Syntax check: passed");
@@ -389,7 +465,7 @@ async function checkPython(request) {
   const errors = [...analysis.errors, ...run.errors];
   const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
   showReport({
-    errors, notes: analysis.notes, callMap: analysis.callMap, run, promptText,
+    errors, notes: analysis.notes, callMap: analysis.callMap, run, promptText, request,
     untraced: { count: analysis.untracedCalls ?? 0, samples: [] },
   });
 }
@@ -452,7 +528,7 @@ async function handleCheck() {
   const syntax = checkSyntaxInBothModes(request.code, log);
   if (!syntax.ok) {
     log.add(`Syntax check: error at line ${syntax.problem.line}`);
-    showSyntaxError(syntax.problem, buildSyntaxPrompt({ ...request, problem: syntax.problem }));
+    showSyntaxError(syntax.problem, buildSyntaxPrompt({ ...request, problem: syntax.problem }), request);
     return;
   }
   request.sourceType = syntax.sourceType;
@@ -481,7 +557,7 @@ async function handleCheck() {
 
   const errors = [...staticErrors, ...run.errors];
   const promptText = errors.length > 0 ? buildLintPrompt({ ...request, errors }) : null;
-  showReport({ errors, notes, callMap: structure.callMap, run, promptText, untraced: structure.untraced });
+  showReport({ errors, notes, callMap: structure.callMap, run, promptText, request, untraced: structure.untraced });
 }
 
 function handleClear() {

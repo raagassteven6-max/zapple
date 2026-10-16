@@ -2385,6 +2385,7 @@ function basisFor(finding, context = {}) {
     if (/^The sandbox could not run the code/.test(finding.message)) return "the sandbox itself failed to start";
     return context.language === "python" ? "Zapple ran this code in the browser's Python" : "Zapple ran this code in a background sandbox";
   }
+  if (id === "syntax") return "the parser could not read the code";
   if (id === "check") return "a line from the Checks box, run against this code";
   if (id === "no-undef") return "compared with names declared in this code, the browser globals and the globals box";
   if (id.startsWith("pyflakes/")) return `pyflakes ${id.slice("pyflakes/".length)}`;
@@ -2540,6 +2541,12 @@ const ZapLog = (() => {
       const rows = (await all('pairs')) || [];
       return rows.filter(p => p.rule === rule && p.from === subject)
                  .sort((a, b) => b.n - a.n).slice(0, 3);
+    },
+
+    /** How many checks are saved. null means this browser cannot store them (private window, blocked storage). */
+    async stats() {
+      const rows = await all('checks');
+      return rows ? { checks: rows.length } : null;
     },
 
     async exportJsonl() {
