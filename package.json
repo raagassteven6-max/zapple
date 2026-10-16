@@ -6,7 +6,8 @@
     "test:js": "node --test tests/test_js.js",
     "test:sandbox": "python3 tests/test_sandbox.py",
     "test:py": "python3 tests/test_py.py",
-    "test": "npm run test:js && npm run test:py && npm run test:sandbox"
+    "test:ui": "python3 tests/test_ui.py",
+    "test": "npm run test:js && npm run test:py && npm run test:sandbox && npm run test:ui"
   },
   "devDependencies": {
     "acorn": "8.11.3",
