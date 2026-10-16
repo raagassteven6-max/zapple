@@ -1,3 +1,4 @@
+name: Test checks.js
 
 # Runs the Zapple test suite on every push and pull request. It does not change the website:
 # GitHub Pages keeps serving the same files. Open the Actions tab to see results.
@@ -32,3 +33,6 @@ jobs:
 
       - name: Sandbox in a real browser (Chromium)
         run: npm run test:sandbox
+
+      - name: Page in a real browser (Chromium)
+        run: npm run test:ui
