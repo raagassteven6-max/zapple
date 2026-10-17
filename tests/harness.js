@@ -16,7 +16,7 @@ function load(file = path.join(__dirname, "..", "checks.js")) {
   ctx.window = ctx;
   vm.runInContext(fs.readFileSync(file, "utf8"), ctx, { filename: "checks.js" });
   const names = ["analyzeStructure", "findStructureProblems", "lintCode", "parseChecks", "buildCheckSource",
-    "buildWorkerSource", "workerSetup", "checkSyntaxInBothModes", "buildCallMap", "findSkipReason"];
+    "buildWorkerSource", "workerSetup", "checkSyntaxInBothModes", "buildCallMap", "findSkipReason", "buildEvidencePacket", "buildLintPrompt"];
   const api = vm.runInContext(`({${names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(",")}})`, ctx);
   api.ctx = ctx;
   api.structureProblems = (code, sourceType = "script") => {

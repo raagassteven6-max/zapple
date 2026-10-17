@@ -38,7 +38,8 @@ def route(r):
     else: r.fulfill(status=200, body="", content_type="text/css")   # fonts
 
 def new_page(browser, init_script=None):
-    ctx = browser.new_context(accept_downloads=True, viewport={"width": 390, "height": 800})
+    ctx = browser.new_context(accept_downloads=True, viewport={"width": 390, "height": 800},
+                              permissions=["clipboard-read", "clipboard-write"])
     ctx.route(lambda u: not u.startswith(f"http://127.0.0.1:{port}"), route)
     if init_script: ctx.add_init_script(init_script)
     page = ctx.new_page()
@@ -100,6 +101,42 @@ with sync_playwright() as p:
     check("H7 delete empties the history", "Nothing saved yet" in page.inner_text("#history-status"), page.inner_text("#history-status"))
     check("H8 no page errors", errors == [], str(errors))
     page.screenshot(path=os.path.join(tempfile.gettempdir(), "zapple-log-mobile.png"), full_page=True)
+    ctx.close()
+
+    # Evidence packet (R27)
+    ctx, page, errors = new_page(browser)
+    run_check(page, "const a = 1;\nconsole.log(a);")
+    page.click("#t-results")
+    check("E1 the evidence packet box is on the Results tab", page.is_visible("summary:has-text('Evidence packet')"))
+    page.click("summary:has-text('Evidence packet')")
+    check("E1b the packet text is shown when opened", "# Zapple evidence packet" in page.inner_text("details:has(summary:has-text('Evidence packet')) pre"))
+    page.click("button:has-text('Copy evidence packet')")
+    page.wait_for_timeout(300)
+    copied = page.evaluate("navigator.clipboard.readText()")
+    check("E2 Copy puts the whole packet on the clipboard", copied.startswith("# Zapple evidence packet") and "## Code" in copied and "console.log(a);" in copied, copied[:120])
+    check("E2b the button confirms", "Copied" in page.inner_text("button:has-text('Copied')"))
+    check("E3 clean run says what was verified", "finished without crashing" in copied, copied[:600])
+
+    run_check(page, "const x = ;")
+    page.click("#t-results")
+    page.click("summary:has-text('Evidence packet')")
+    page.click("button:has-text('Copy evidence packet')")
+    page.wait_for_timeout(300)
+    copied = page.evaluate("navigator.clipboard.readText()")
+    check("E4 syntax error packet says later stages were not reached", "does not parse" in copied and "Line 1" in copied, copied[:600])
+    check("E5 no page errors", errors == [], str(errors))
+    page.screenshot(path=os.path.join(tempfile.gettempdir(), "zapple-packet-mobile.png"), full_page=True)
+    ctx.close()
+
+    ctx, page, errors = new_page(browser)
+    run_check(page, "const a = 1;\nconst b = undefinedName;\nconsole.log(a, b);")
+    page.click("#t-results")
+    page.click("summary:has-text('Evidence packet')")
+    page.click("button:has-text('Copy evidence packet')")
+    page.wait_for_timeout(300)
+    copied = page.evaluate("navigator.clipboard.readText()")
+    check("E6 a real runtime crash appears under Problems, with the run marked as finding problems",
+          "## Problems" in copied and "undefinedName" in copied and "found problems" in copied, copied[:700])
     ctx.close()
 
     # Saving impossible (private window / blocked storage): checks must still work

@@ -1,6 +1,6 @@
 """Python-side tests: CPython + real pyflakes against the Python embedded in checks.js.
 Usage: PYTHONPATH=<dir containing pyflakes> python3 test_py.py [path/to/checks.js]"""
-import asyncio, io, os, subprocess, sys, unittest
+import asyncio, io, json, os, subprocess, sys, unittest
 
 sys.stdin = io.StringIO("")   # like Pyodide: input() hits end-of-file instead of waiting
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -154,6 +154,62 @@ class Regression(unittest.TestCase):      # R14
                 'def top(xs, n=2):\n    return [k for k, _ in collections.Counter(xs).most_common(n)]\n'
                 'data = parse("1 2 2 3 3 3")\nprint(json.dumps(top(data), indent=2))\nprint(list(itertools.pairwise(data))[:2])\n')
         r = run(code); self.assertEqual(r["errors"], []); self.assertEqual(r["runErrors"], [])
+
+class Libraries(unittest.TestCase):       # R15-R18 (CPython here has numpy and pandas; in the browser a loader fetches them)
+    def needed(self, code): return ns["libraries_needed"](code)
+    def run_with_loader(self, code, checks=(), failed=()):
+        calls = []
+        async def loader(names_json):
+            calls.append(json.loads(names_json)); return json.dumps(list(failed))
+        r = asyncio.run(ns["analyze"]({"code": code, "extraNames": [], "checks": list(checks)}, loader))
+        return r, calls
+
+    def test_R15_finds_allowlisted_imports(self):
+        self.assertEqual(self.needed("import numpy as np\nfrom pandas import DataFrame\nimport os\n"), ["numpy", "pandas"])
+    def test_R15_submodules_and_duplicates(self):
+        self.assertEqual(self.needed("import numpy.linalg as la\nimport numpy\nfrom numpy.random import rand\n"), ["numpy"])
+    def test_R15_other_libraries_and_stdlib_are_not_listed(self):
+        self.assertEqual(self.needed("import torch\nimport os\nimport transformers\n"), [])
+    def test_R15_syntax_error_and_relative_import(self):
+        self.assertEqual(self.needed("import numpy as\n"), [])
+        self.assertEqual(self.needed("from . import numpy\n"), [])
+    def test_R15_magic_lines_do_not_hide_imports(self):
+        self.assertEqual(self.needed("%matplotlib inline\nimport pandas as pd\n"), ["pandas"])
+
+    def test_R16_loader_called_once_before_the_run(self):
+        r, calls = self.run_with_loader("import numpy as np\nimport pandas as pd\nprint(np.arange(4).sum())\n")
+        self.assertEqual(calls, [["numpy", "pandas"]]); self.assertEqual(r["output"], ["6"]); self.assertIsNone(r["skipReason"])
+    def test_R16_loader_not_called_without_libraries(self):
+        _, calls = self.run_with_loader("print(1)\n"); self.assertEqual(calls, [])
+    def test_R16_loader_not_called_when_static_errors_stop_the_run(self):
+        r, calls = self.run_with_loader("import numpy as np\nprint(undefined_name)\n")
+        self.assertEqual(calls, []); self.assertTrue(r["errors"])
+    def test_R16_no_loader_still_works(self):
+        r = run("import numpy as np\nprint(np.arange(3).sum())\n"); self.assertEqual(r["output"], ["3"])
+    def test_R16_pandas_code_and_checks_run_for_real(self):
+        code = 'import pandas as pd\ndf = pd.DataFrame({"a": [1, 2, 3]})\ntotal = int(df["a"].sum())\nprint(total)\n'
+        r, _ = self.run_with_loader(code, ["total == 6", "total == 7"])
+        self.assertEqual(r["output"], ["6"]); self.assertEqual(r["checkCount"], 2); self.assertEqual(len(r["runErrors"]), 1)
+
+    def test_R17_failed_download_is_a_skip_not_a_problem(self):
+        ns["RUNNABLE_LIBRARIES"].add("zz_missing_lib")
+        try:
+            r, calls = self.run_with_loader("import zz_missing_lib\nprint(1)\n", failed=["zz_missing_lib"])
+        finally:
+            ns["RUNNABLE_LIBRARIES"].discard("zz_missing_lib")
+        self.assertEqual(calls, [["zz_missing_lib"]]); self.assertEqual(r["runErrors"], [])
+        self.assertIn("could not be downloaded", r["skipReason"]); self.assertIn("zz_missing_lib", r["skipReason"])
+    def test_R17_other_library_keeps_the_skip_and_lists_what_is_available(self):
+        r, calls = self.run_with_loader("import torch\nprint(1)\n")
+        self.assertEqual(calls, []); self.assertEqual(r["runErrors"], [])
+        self.assertIn("torch", r["skipReason"]); self.assertIn("numpy", r["skipReason"]); self.assertIn("pandas", r["skipReason"])
+
+    def test_R18_real_numpy_error_is_a_problem(self):
+        r, _ = self.run_with_loader("import numpy as np\nvalues = np.zeros(3)\nprint(values[5])\n")
+        self.assertEqual(len(r["runErrors"]), 1); self.assertIn("IndexError", r["runErrors"][0]["message"]); self.assertEqual(r["runErrors"][0]["line"], 3)
+    def test_R18_static_checks_still_run_on_library_code(self):
+        r, _ = self.run_with_loader("import numpy as np\nvalues = np.zeros(3)\nprint(valeus)\n")
+        self.assertTrue(any("valeus" in m for m in msgs(r["errors"])))
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

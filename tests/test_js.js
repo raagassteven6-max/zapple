@@ -191,3 +191,107 @@ test("L4 built-in members are never treated as typos of own names", () =>
   assert.equal(typoNotes("const o = {lengths: 1}; console.log([1].length, o.lengths);").length, 0));
 test("L4 feature detection quiet", () =>
   assert.equal(typoNotes("const o = {quantity: 1}; if (o.quantitty) console.log(o.quantitty);").length, 0));
+
+// ---- R21-R26 evidence packet
+const finding = (over) => ({ line: 2, column: 7, message: "'y' is not defined.", ruleId: "no-undef", severity: "error", ...over });
+const packet = (over = {}) => z.buildEvidencePacket({
+  language: "javascript", sourceType: "script", task: "", code: "const x = 1;\nconst z = y;\n",
+  errors: [], notes: [], run: { status: "finished", durationMs: 12, checkCount: 0, output: [], errors: [] },
+  callMap: "", untraced: { count: 0, samples: [] }, extraGlobals: [], checksText: "", ...over,
+});
+const section = (text, title) => { const m = new RegExp(`^## ${title}[^\\n]*\\n([\\s\\S]*?)(?=^## |(?![\\s\\S]))`, "m").exec(text); return m ? m[1] : null; };
+
+test("R21 section order is fixed and the header says no AI produced the evidence", () => {
+  const text = packet({ errors: [finding()], notes: [finding({ severity: "note", ruleId: "zapple/x", message: "hint" })], callMap: "a -> b", checksText: "1 === 1",
+    run: { status: "finished", durationMs: 5, checkCount: 1, output: ["hi"], errors: [] } });
+  assert.match(text, /^# Zapple evidence packet/);
+  const titles = [...text.matchAll(/^## (\S+)/gm)].map((m) => m[1]);
+  assert.deepEqual(titles, ["Verdict", "Verified", "Not", "Problems", "Notes", "Console", "Call", "Checks", "Code", "How"]);
+  assert.match(text, /No AI was involved/);
+});
+test("R21 same input gives the same text", () => assert.equal(packet({ errors: [finding()] }), packet({ errors: [finding()] })));
+
+test("R22 problem shows place, message, rule, basis and the source line", () => {
+  const p = section(packet({ errors: [finding()] }), "Problems");
+  assert.match(p, /1\. Line 2, column 7: 'y' is not defined\./);
+  assert.match(p, /Rule: no-undef/); assert.match(p, /Found by: compared with names declared/); assert.match(p, /Source: const z = y;/);
+});
+test("R22 notes are labelled as hints that may be wrong", () => {
+  const text = packet({ notes: [finding({ severity: "note", ruleId: "zapple/possible-property-typo", message: "maybe quantity?" })] });
+  assert.match(text, /^## Notes[^\n]*may be wrong/m); assert.match(section(text, "Notes"), /maybe quantity\?/);
+});
+test("R22 empty optional sections are left out", () => {
+  const text = packet();
+  for (const t of ["Problems", "Notes", "Console output", "Call map", "Checks box"]) assert.equal(section(text, t), null, t);
+  assert.match(section(text, "Verdict"), /No problems/);
+});
+
+test("R23 clean finished run is listed as verified with time", () => {
+  const v = section(packet({ run: { status: "finished", durationMs: 12, checkCount: 3, output: [], errors: [] } }), "Verified");
+  assert.match(v, /Syntax/); assert.match(v, /finished without crashing \(12 ms\)/); assert.match(v, /3 of 3 passed/);
+});
+test("R23 skipped run: reason is under Not verified, not under Verified", () => {
+  const text = packet({ run: { status: "skipped", reason: "it uses THREE, a library", tip: "", durationMs: 0, checkCount: 0, output: [], errors: [] }, checksText: "1 === 1" });
+  assert.match(section(text, "Not verified"), /it uses THREE, a library/); assert.match(section(text, "Not verified"), /Checks box/);
+  assert.doesNotMatch(section(text, "Verified"), /finished/);
+});
+test("R23 run skipped because of static problems says it was not attempted", () => {
+  const text = packet({ errors: [finding()], run: { status: "skipped", reason: z.ctx.FIX_FIRST.reason, tip: "", durationMs: 0, checkCount: 0, output: [], errors: [] } });
+  assert.match(section(text, "Not verified"), /not attempted/); assert.doesNotMatch(section(text, "Not verified"), /would only repeat/);
+});
+test("R23 failed Checks line is counted as failed", () => {
+  const run = { status: "finished", durationMs: 4, checkCount: 2, output: [], errors: [finding({ ruleId: "check", message: "add(1,2) === 4 failed (got 3)", line: null, column: null })] };
+  assert.match(section(packet({ errors: run.errors, run, checksText: "a\nb" }), "Verified"), /1 of 2 passed|2 written, 1 failed/);
+});
+test("R23 untraced calls are counted and static checks cannot prove intent", () => {
+  const n = section(packet({ untraced: { count: 4, samples: ["foo()", "bar()"] } }), "Not verified");
+  assert.match(n, /4 calls could not be traced/); assert.match(n, /foo\(\)/); assert.match(n, /cannot prove/);
+});
+test("R23 syntax error: later stages were not reached", () => {
+  const text = packet({ errors: [finding({ ruleId: "syntax", message: "Unexpected token", line: 1, column: 11 })], run: { status: "skipped", reason: z.ctx.FIX_FIRST.reason, durationMs: 0, checkCount: 0, output: [], errors: [] } });
+  assert.match(section(text, "Not verified"), /not reached/); assert.doesNotMatch(section(text, "Verified"), /Rules/);
+});
+
+test("R24 console output is capped at 40 lines and says how many were left out", () => {
+  const output = Array.from({ length: 55 }, (_, i) => `line ${i}`);
+  const c = section(packet({ run: { status: "finished", durationMs: 1, checkCount: 0, output, errors: [] } }), "Console output");
+  assert.match(c, /line 39/); assert.doesNotMatch(c, /line 40\b/); assert.match(c, /15 more lines not shown/);
+});
+test("R24 call map capped at 60 lines", () => {
+  const map = Array.from({ length: 70 }, (_, i) => `f${i} -> g${i}`).join("\n");
+  const c = section(packet({ callMap: map }), "Call map");
+  assert.match(c, /f59 -> g59/); assert.doesNotMatch(c, /f60 -> g60/); assert.match(c, /10 more lines not shown/);
+});
+test("R24 very long quoted source lines are cut, the Code section keeps them whole", () => {
+  const long = "const s = '" + "a".repeat(500) + "';";
+  const text = packet({ code: long + "\n", errors: [finding({ line: 1 })] });
+  assert.ok(section(text, "Problems").length < 600); assert.ok(section(text, "Code").includes("a".repeat(500)));
+});
+
+test("R25 code has line numbers matching the problem list and a fence safe against backticks", () => {
+  const text = packet({ code: "const a = `x`;\nconst b = '```';\n", errors: [finding({ line: 2 })] });
+  const code = section(text, "Code");
+  assert.match(code, /^`{4,}/m); assert.match(code, /^ *1 \| const a = `x`;/m); assert.match(code, /^ *2 \| const b = '```';/m);
+});
+test("R25 code containing a fake heading does not create a section", () => {
+  const text = packet({ code: "## Problems\nconst a = 1;\n" });
+  assert.equal([...text.matchAll(/^## Problems/gm)].length, 0);
+});
+
+test("R26 task, extra names and checks appear only when present", () => {
+  const plain = packet();
+  assert.doesNotMatch(plain, /Task:/); assert.doesNotMatch(plain, /Extra names/);
+  const full = packet({ task: "sum a list", extraGlobals: ["THREE", "Chart"], checksText: "add(1,2) === 3" });
+  assert.match(full, /Task: sum a list/); assert.match(full, /Extra names declared: THREE, Chart/); assert.match(section(full, "Checks box"), /add\(1,2\) === 3/);
+});
+test("R21 Python is described with the version the browser runs", () => {
+  const text = packet({ language: "python", sourceType: undefined, code: "print(1)\n" });
+  assert.match(text, /Language: Python/); assert.match(text, /3\.12/); assert.match(section(text, "Verified"), /pyflakes/);
+});
+test("R21 module vs script is stated for JavaScript", () => {
+  assert.match(packet({ sourceType: "module" }), /JavaScript ES module/); assert.match(packet({ sourceType: "script" }), /JavaScript plain script/);
+});
+test("R22 UI-only hint about the Extra names box is rephrased for the AI", () => {
+  const text = packet({ errors: [finding({ message: `'THREE' is not defined. If it comes from a library you load on your page, add "THREE" to Extra names.` })] });
+  assert.doesNotMatch(text, /Extra names\./); assert.match(text, /'THREE' is not defined\. \(If it comes from a library the page loads/);
+});
