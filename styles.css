@@ -226,6 +226,9 @@
   details.result[open] > summary { margin-bottom: 10px; }
   details.result .code-frame { max-height: 340px; overflow: auto; }
 
+  details.result .btn { width: 100%; margin-bottom: 12px; }
+  details.result > .hint { margin: 0 0 12px; }
+
   .prompt-section { display: grid; gap: 12px; padding: 20px; background: var(--bg); border-radius: 28px; box-shadow: var(--raise); }
   .prompt-section label { margin: 0; }
   .prompt-box { min-height: 180px; }

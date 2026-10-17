@@ -1418,6 +1418,18 @@ def outside_packages(tree):
             names.add(node.module.split(".")[0])
     return sorted(names - set(sys.stdlib_module_names))
 
+# Libraries Zapple can really run: Pyodide has them, and they are small enough to download on demand.
+# Adding a name here is not enough on its own: Pyodide must also ship that package.
+RUNNABLE_LIBRARIES = {"numpy", "pandas"}
+
+def runnable_in(tree):
+    return [name for name in outside_packages(tree) if name in RUNNABLE_LIBRARIES]
+
+def libraries_needed(code):
+    """The allowlisted libraries the code imports, so the browser can download them before the run."""
+    tree, _, _ = parse_code(code)
+    return runnable_in(tree) if tree is not None else []
+
 def rule_findings(tree, extra_names):
     checker = Checker(tree, builtins=extra_names)
     findings = []
@@ -1451,7 +1463,7 @@ class AsyncRunRewriter(ast.NodeTransformer):
             return ast.copy_location(ast.Await(value=node.args[0]), node)
         return node
 
-def environment_limit(error, outside):
+def environment_limit(error, outside, unavailable=()):
     if isinstance(error, AttributeError) and re.match(r"module '[\w.]+' has no attribute", str(error)) \
             and str(error).split("'")[1].split(".")[0] in sys.stdlib_module_names:
         return (f"it uses something from the standard library that this version of Python does not have ({error}). "
@@ -1462,9 +1474,14 @@ def environment_limit(error, outside):
     if isinstance(error, EOFError) and "reading a line" in str(error):
         return ("it waits for you to type something with input(). "
                 "Zapple's Python runs without a keyboard, so this code cannot run here even if it is correct.")
-    if isinstance(error, ModuleNotFoundError) and (error.name or "").split(".")[0] in outside:
-        return (f"it imports {error.name}, which is not part of standard Python. "
-                "Zapple's Python runs inside your browser and only has the standard library for now.")
+    top = (error.name or "").split(".")[0] if isinstance(error, ModuleNotFoundError) else ""
+    if top in unavailable:
+        return (f"it uses {top}, which could not be downloaded just now (no internet connection, or the download was blocked). "
+                "Check your connection and press Check again.")
+    if top and top in outside:
+        available = ", ".join(sorted(RUNNABLE_LIBRARIES))
+        return (f"it imports {error.name}, which Zapple cannot run. "
+                f"Zapple's Python runs inside your browser and has the standard library plus {available}.")
     if "can't start new thread" in str(error):
         return ("it starts threads (for example with ThreadPoolExecutor). Zapple's Python runs inside your browser, "
                 "which does not allow threads, so this code cannot run here even if it is correct.")
@@ -2140,7 +2157,7 @@ def analyze_structure(tree, check_lines):
     untraced = sum(len(items) for items in walker.not_followed.values())
     return errors, call_map, definitions, untraced
 
-async def analyze(request):
+async def analyze(request, load_libraries=None):
     tree, blanked, error = parse_code(request["code"])
     result = {"blanked": blanked, "syntax": None, "errors": [], "notes": [], "skipReason": None,
               "output": [], "runErrors": [], "checkCount": 0,
@@ -2168,12 +2185,19 @@ async def analyze(request):
         return result
 
     outside = outside_packages(tree)
+    unavailable = set()
+    needed = runnable_in(tree)
+    if needed and load_libraries is not None:
+        try:
+            unavailable = set(json.loads(await load_libraries(json.dumps(needed))))
+        except Exception:
+            unavailable = set(needed)
     namespace, result["output"], error, (exit_code, exit_line) = await run_code(tree)
     if exit_code is not None and exit_code != 0:
         result["notes"].append(finding(
             f"The code stopped early with exit code {exit_code!r}, so anything after that point did not run",
             exit_line, None, "zapple/early-exit", "note"))
-    limit = environment_limit(error, outside) if error else None
+    limit = environment_limit(error, outside, unavailable) if error else None
     if limit:
         result["skipReason"], result["output"] = limit, []
     elif error:
@@ -2182,15 +2206,67 @@ async def analyze(request):
         result["runErrors"], result["checkCount"] = run_checks(request["checks"], namespace)
     return result
 
-async def zapple_analyze(request_json):
+async def zapple_analyze(request_json, load_libraries=None):
     started = time.perf_counter()
-    result = await analyze(json.loads(request_json))
+    result = await analyze(json.loads(request_json), load_libraries)
     result["elapsedMs"] = round((time.perf_counter() - started) * 1000)
     return json.dumps(result)
 `;
 
 function pythonWorkerMain() {
   let pyodide = null;
+  let blockedNames = [];
+  const originals = new Map();       // what each blocked name was before, so it can be put back while libraries download
+  const loadedLibraries = new Set();
+
+  /** The user's code must not reach the network, so the browser's network APIs throw while it runs. */
+  function blockApis() {
+    for (const name of blockedNames) {
+      if (!originals.has(name)) originals.set(name, Object.getOwnPropertyDescriptor(self, name) ?? null);
+      Object.defineProperty(self, name, {
+        configurable: true,
+        get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
+      });
+    }
+  }
+
+  /** Only while Zapple itself downloads a library (never while user code runs). */
+  function unblockApis() {
+    for (const [name, original] of originals) {
+      if (original) Object.defineProperty(self, name, original);
+      else delete self[name];
+    }
+    originals.clear();
+  }
+
+  /**
+   * Called from the Python side with a JSON list of library names. Downloads each one, imports it once so the
+   * first import is not counted against the code's time limit, and answers with a JSON list of names that failed.
+   */
+  async function loadLibraries(namesJson) {
+    const names = JSON.parse(namesJson).filter((name) => /^[A-Za-z][A-Za-z0-9_]*$/.test(name));
+    const missing = names.filter((name) => !loadedLibraries.has(name));
+    if (missing.length === 0) return "[]";
+
+    const failed = [];
+    self.postMessage({ type: "loading", names: missing });
+    unblockApis();
+    try {
+      for (const name of missing) {
+        try {
+          await pyodide.loadPackage([name]);
+          pyodide.runPython(`import ${name}`);
+          loadedLibraries.add(name);
+        } catch (error) {
+          failed.push(name);
+        }
+      }
+    } finally {
+      blockApis();
+    }
+    self.postMessage({ type: "loaded", failed });
+    return JSON.stringify(failed);
+  }
 
   self.onmessage = async ({ data }) => {
     if (data.type === "init") {
@@ -2201,11 +2277,8 @@ function pythonWorkerMain() {
         await pyodide.pyimport("micropip").install("pyflakes");
         pyodide.runPython(data.pythonSource);
 
-        for (const name of data.blockedNames) {
-          Object.defineProperty(self, name, {
-            get() { throw new Error(`${name} is blocked in the Zapple sandbox`); },
-          });
-        }
+        blockedNames = data.blockedNames;
+        blockApis();
         self.postMessage({ type: "ready" });
       } catch (error) {
         self.postMessage({ type: "failed", message: String(error) });
@@ -2213,7 +2286,7 @@ function pythonWorkerMain() {
     } else if (data.type === "run") {
       try {
         const analyze = pyodide.globals.get("zapple_analyze");
-        const answer = await analyze(JSON.stringify(data.request));
+        const answer = await analyze(JSON.stringify(data.request), loadLibraries);
         self.postMessage({ type: "result", result: JSON.parse(answer) });
       } catch (error) {
         self.postMessage({ type: "result", result: { internalError: String(error) } });
@@ -2256,24 +2329,45 @@ async function runPythonAnalysis(request, log) {
   const worker = await getPythonWorker(log);
 
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
+    let timer = null;
+    let loadingSince = 0;
+    const stopWorker = (answer) => {
+      clearTimeout(timer);
       worker.terminate();
       pythonWorker = null;
-      resolve({ timedOut: true });
-    }, RUN_TIMEOUT_MS);
+      resolve(answer);
+    };
+    // The run limit covers the code only. While libraries download, a separate and longer limit applies.
+    const startRunTimer = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => stopWorker({ timedOut: true }), RUN_TIMEOUT_MS);
+    };
+    const startLoadTimer = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => stopWorker({ workerFailed: "loading the libraries took too long. Check your internet connection and try again" }), PYTHON_LOAD_TIMEOUT_MS);
+    };
 
     worker.onmessage = ({ data }) => {
-      if (data.type !== "result") return;
-      clearTimeout(timer);
-      resolve(data.result);
+      if (data.type === "loading") {
+        loadingSince = performance.now();
+        log.add(`Loading ${data.names.join(", ")} (a few MB the first time, then it stays loaded)...`);
+        startLoadTimer();
+      } else if (data.type === "loaded") {
+        const seconds = ((performance.now() - loadingSince) / 1000).toFixed(1);
+        log.add(data.failed.length > 0
+          ? `Could not download ${data.failed.join(", ")} (${seconds} s). Code that needs it will not be test-run`
+          : `Libraries ready (${seconds} s)`);
+        startRunTimer();
+      } else if (data.type === "result") {
+        clearTimeout(timer);
+        resolve(data.result);
+      }
     };
     worker.onerror = (event) => {
       event.preventDefault();
-      clearTimeout(timer);
-      worker.terminate();
-      pythonWorker = null;
-      resolve({ workerFailed: event.message || "unknown error" });
+      stopWorker({ workerFailed: event.message || "unknown error" });
     };
+    startRunTimer();
     worker.postMessage({ type: "run", request });
   });
 }
@@ -2369,6 +2463,125 @@ function buildLintPrompt({ code, errors, language, sourceType, task }) {
     details: `Problems found:\n${problems.join("\n")}`,
     rules: LINT_FIX_RULES,
   });
+}
+
+// ---------- Evidence packet: everything Zapple knows, as one text for an AI ----------
+
+const PACKET_MAX_OUTPUT_LINES = 40;
+const PACKET_MAX_MAP_LINES = 60;
+const PACKET_MAX_QUOTE = 200;
+const PYTHON_RUNTIME_NOTE = "Python 3.12 (the version Zapple runs in the browser; features newer than 3.12 cannot run there)";
+
+const PACKET_HEADER = "Everything below comes from deterministic tools (a parser, linters, and a test run in a sandbox). "
+  + "No AI was involved. Treat Problems as confirmed facts and Notes as hints that may be wrong.";
+
+const PACKET_INSTRUCTIONS = [
+  "- Treat every item under Problems as confirmed. Fix those first and change nothing else.",
+  "- Check each Note against the code yourself. Say which are real and which are false alarms, one line each.",
+  "- Do not claim the code works beyond what Verified says. Name what could still be wrong, using the Not verified list.",
+  "- Reply with: (1) a short verdict, (2) the complete corrected code in one code block, (3) one line per change.",
+].join("\n");
+
+function packetLimit(lines, max) {
+  const hidden = lines.length - max;
+  return hidden > 0
+    ? `${lines.slice(0, max).join("\n")}\n(${countLabel(hidden, "more line")} not shown)`
+    : lines.join("\n");
+}
+
+function packetClip(text, limit) {
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function packetFinding(finding, index, sourceLines, language) {
+  const place = finding.line ? `Line ${finding.line}${finding.column ? `, column ${finding.column}` : ""}: ` : "";
+  // The page's hint about the "Extra names" box is for the person using Zapple. The AI gets the underlying fact instead.
+  const message = finding.message.replace(/ If it comes from a library you load on your page, add "[^"]*" to Extra names\./,
+    " (If it comes from a library the page loads, Zapple does not know about it.)");
+  const rows = [`${index + 1}. ${place}${message}`];
+  if (finding.ruleId) rows.push(`   Rule: ${finding.ruleId}`);
+  rows.push(`   Found by: ${basisFor(finding, { language })}`);
+  const source = finding.line ? (sourceLines[finding.line - 1] ?? "").trim() : "";
+  if (source) rows.push(`   Source: ${packetClip(source, PACKET_MAX_QUOTE)}`);
+  return rows.join("\n");
+}
+
+/** What was checked and how far each check got, split into "verified" and "not verified" so nothing is over-claimed. */
+function packetCoverage({ language, errors, run, untraced, checksText }) {
+  const verified = [];
+  const notVerified = [];
+  const syntaxFailed = errors.some((finding) => finding.ruleId === "syntax");
+  const wroteChecks = checksText.trim() !== "";
+
+  if (syntaxFailed) {
+    notVerified.push("Rules, structure and the test run were not reached, because the code does not parse.");
+  } else {
+    verified.push("Syntax: the code parses.");
+    verified.push(language === "python"
+      ? "Rules and structure: pyflakes and Zapple's structure checks (names, calls, arguments) ran."
+      : "Rules and structure: ESLint rules and Zapple's structure checks (names, calls, arguments) ran.");
+    if (run.status === "skipped") {
+      if (run.reason === FIX_FIRST.reason) {
+        notVerified.push("Test run: not attempted, because the static checks found problems first. Fix those, then check again.");
+      } else {
+        notVerified.push(`Test run: skipped. Why: ${run.reason}`);
+      }
+      if (wroteChecks) notVerified.push("Checks box: not run (the checks run as part of the test run).");
+    } else {
+      const runErrors = run.errors ?? [];
+      verified.push(runErrors.length === 0
+        ? `Test run: finished without crashing (${run.durationMs} ms).`
+        : "Test run: the code ran, and the run found problems (listed under Problems).");
+      if (run.checkCount > 0) {
+        const failed = errors.filter((finding) => finding.ruleId === "check").length;
+        verified.push(`Checks box: ${Math.max(run.checkCount - failed, 0)} of ${run.checkCount} passed.`);
+      }
+    }
+  }
+  if (untraced.count > 0) {
+    const examples = untraced.samples.length > 0 ? ` (for example ${untraced.samples.join(", ")})` : "";
+    notVerified.push(`${countLabel(untraced.count, "call")} could not be traced by reading the code${examples}.`);
+  }
+  notVerified.push("Whether the code does what it is meant to do: static checks cannot prove that. Only the Checks box tests behavior, and only for what it asserts.");
+  return { verified, notVerified, syntaxFailed };
+}
+
+function buildEvidencePacket({ language, sourceType, task, code, errors, notes, run, callMap, untraced = { count: 0, samples: [] }, extraGlobals = [], checksText = "" }) {
+  const sourceLines = code.split("\n");
+  const numberedLines = code.endsWith("\n") ? sourceLines.slice(0, -1) : sourceLines;
+  const width = String(numberedLines.length).length;
+  const numbered = numberedLines.map((line, index) => `${String(index + 1).padStart(width)} | ${line}`).join("\n");
+  const fence = fenceFor(numbered);
+
+  const { verified, notVerified, syntaxFailed } = packetCoverage({ language, errors, run, untraced, checksText });
+  const runWord = syntaxFailed ? "not reached"
+    : run.status !== "skipped" ? "finished"
+    : run.reason === FIX_FIRST.reason ? "not attempted" : "skipped";
+
+  const sections = [
+    ["# Zapple evidence packet", PACKET_HEADER].join("\n"),
+    [
+      `Language: ${language === "python" ? PYTHON_RUNTIME_NOTE : describeCodeType({ language, sourceType })}`,
+      `Size: ${countLabel(sourceLines.length, "line")}`,
+      task ? `Task: ${task}` : null,
+      extraGlobals.length > 0 ? `Extra names declared: ${extraGlobals.join(", ")}` : null,
+    ].filter(Boolean).join("\n"),
+    `## Verdict\n${errors.length > 0 ? countLabel(errors.length, "problem") : "No problems"}`
+      + `${notes.length > 0 ? `, ${countLabel(notes.length, "note")}` : ""}. Test run: ${runWord}.`,
+    `## Verified\n${verified.length > 0 ? verified.map((row) => `- ${row}`).join("\n") : "- Nothing: the code does not parse."}`,
+    `## Not verified\n${notVerified.map((row) => `- ${row}`).join("\n")}`,
+    errors.length > 0
+      ? `## Problems (confirmed by a tool)\n${errors.map((f, i) => packetFinding(f, i, sourceLines, language)).join("\n")}` : null,
+    notes.length > 0
+      ? `## Notes (hints; any of these may be wrong)\n${notes.map((f, i) => packetFinding(f, i, sourceLines, language)).join("\n")}` : null,
+    run.output?.length > 0
+      ? `## Console output (what the code printed during the test run)\n${packetLimit(run.output.map((line) => packetClip(line, PACKET_MAX_QUOTE)), PACKET_MAX_OUTPUT_LINES)}` : null,
+    callMap ? `## Call map (who calls whom, from reading the code)\n${packetLimit(callMap.split("\n"), PACKET_MAX_MAP_LINES)}` : null,
+    checksText.trim() ? `## Checks box (expressions the user wrote; they ran against the code)\n${checksText.trim()}` : null,
+    `## Code\n${fence}\n${numbered}\n${fence}`,
+    `## How to use this\n${PACKET_INSTRUCTIONS}`,
+  ];
+  return sections.filter(Boolean).join("\n\n");
 }
 
 // ---------- Finding labels and local telemetry ----------

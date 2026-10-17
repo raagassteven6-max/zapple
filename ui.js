@@ -163,7 +163,12 @@ function showSyntaxError(problem, promptText, request) {
   });
   botState("fail");
   saveToHistory(request, [{ ...problem, ruleId: "syntax", severity: "error" }], skippedRun(FIX_FIRST.reason, FIX_FIRST.tip));
-  showResult(box, buildPromptSection(promptText));
+  const syntaxFinding = { ...problem, ruleId: "syntax", severity: "error" };
+  const packetBox = buildPacketSection({
+    request, errors: [syntaxFinding], notes: [], run: skippedRun(FIX_FIRST.reason, FIX_FIRST.tip), callMap: "",
+    untraced: { count: 0, samples: [] },
+  });
+  showResult(box, buildPromptSection(promptText), ...(packetBox ? [packetBox] : []));
 }
 
 /** The repair prompt in a read-only box, with a button that copies it. */
@@ -197,6 +202,42 @@ async function copyPrompt(promptBox, button) {
     promptBox.select();
     flashLabel(button, "Selected. Copy it manually");
   }
+}
+
+/**
+ * The evidence packet: everything Zapple knows as one text for any AI (built by buildEvidencePacket in checks.js).
+ * A foldable box with a Copy button. If it cannot be built, the report still shows without it.
+ */
+function buildPacketSection({ request, errors, notes, run, callMap, untraced }) {
+  if (!request) return null;
+  let packetText;
+  try {
+    packetText = buildEvidencePacket({ ...request, errors, notes, run, callMap, untraced });
+  } catch (error) {
+    log.add(`Could not build the evidence packet (${error.message}). The result is not affected`);
+    return null;
+  }
+  const preview = el("pre", "code-frame", packetText);
+  const copyButton = el("button", "btn", "Copy evidence packet");
+  copyButton.type = "button";
+  copyButton.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(packetText);
+      flashLabel(copyButton, "Copied");
+    } catch {
+      // Clipboard blocked: select the text so it can be copied by hand
+      getSelection().selectAllChildren(preview);
+      flashLabel(copyButton, "Selected. Copy it manually");
+    }
+  });
+  const box = el("details", "result note textbox side");
+  box.append(
+    el("summary", "result-title", "Evidence packet"),
+    el("p", "hint", "Everything Zapple found, in one message. Paste it into any AI chat to get an analysis that knows what was and was not verified."),
+    copyButton,
+    preview
+  );
+  return box;
 }
 
 /** Shows a message on a button for two seconds, then restores its label. */
@@ -316,6 +357,8 @@ function showReport({ errors, notes, callMap, run, promptText, request, untraced
   if (run.output.length > 0) {
     blocks.push(buildTextBox("Console output", run.output.join("\n"), true));
   }
+  const packetBox = buildPacketSection({ request, errors, notes, run, callMap, untraced });
+  if (packetBox) blocks.push(packetBox);
   setSummary(buildReportSummary({ errors, notes, run }));
   botState(errors.length > 0 ? "fail" : run.status === "skipped" ? "cantrun" : "pass");
   saveToHistory(request, [...errors, ...notes], run);
