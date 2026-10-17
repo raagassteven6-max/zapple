@@ -36,3 +36,26 @@ jobs:
 
       - name: Page in a real browser (Chromium)
         run: npm run test:ui
+
+      - name: Python worker library loading (fake Pyodide)
+        run: npm run test:pyworker
+
+  # Separate job so a slow or unreachable CDN never hides the results above.
+  real-pyodide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          npm install --no-audit --no-fund
+          python -m pip install -r requirements-test.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Real Pyodide with numpy and pandas
+        run: npm run test:pyodide
