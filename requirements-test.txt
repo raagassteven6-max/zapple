@@ -1,2 +1,4 @@
 pyflakes
 playwright
+numpy
+pandas

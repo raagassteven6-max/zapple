@@ -7,7 +7,9 @@
     "test:sandbox": "python3 tests/test_sandbox.py",
     "test:py": "python3 tests/test_py.py",
     "test:ui": "python3 tests/test_ui.py",
-    "test": "npm run test:js && npm run test:py && npm run test:sandbox && npm run test:ui"
+    "test:pyworker": "python3 tests/test_pyworker.py",
+    "test:pyodide": "python3 tests/test_pyodide_real.py",
+    "test": "npm run test:js && npm run test:py && npm run test:sandbox && npm run test:ui && npm run test:pyworker"
   },
   "devDependencies": {
     "acorn": "8.11.3",
